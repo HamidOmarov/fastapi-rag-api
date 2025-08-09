@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic==2.*
+pydantic-settings
+sentence-transformers
+faiss-cpu
+pypdf
+python-dotenv

@@ -1,6 +1,12 @@
-venv/
+﻿venv/
 .venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.log
+.env
+data/uploads/
+data/index/
+.git
+.gitignore
