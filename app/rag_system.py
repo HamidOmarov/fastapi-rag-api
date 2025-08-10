@@ -114,7 +114,7 @@ class SimpleRAG:
         chunks: List[str] = []
         for txt in pages:
             for i in range(0, len(txt), step):
-                part = txt[i : i + step].strip()
+                part = txt[i:i+step].strip()
                 if part:
                     chunks.append(part)
         return chunks
@@ -153,7 +153,7 @@ class SimpleRAG:
                     cache_dir=str(self.cache_dir),
                     device=-1,
                 )
-            outs = self._translator(texts, max_length=400)
+            outs = self._translator(texts, max_length=800)
             return [o["translation_text"].strip() for o in outs]
         except Exception:
             return texts
@@ -162,11 +162,23 @@ class SimpleRAG:
         if not contexts:
             return "No relevant context found. Please upload a PDF or ask a more specific question."
 
-        # 1) candidates (aggressive clean)
+        # 1) Clean & keep top contexts
+        cleaned_contexts = [_clean_for_summary(c) for c in contexts[:5]]
+        cleaned_contexts = [c for c in cleaned_contexts if len(c) > 40]
+        if not cleaned_contexts:
+            return "The document appears largely tabular/numeric; couldn't extract readable sentences."
+
+        # 2) Pre-translate paragraphs to EN (if output language is EN)
+        if OUTPUT_LANG == "en":
+            try:
+                cleaned_contexts = self._translate_to_en(cleaned_contexts)
+            except Exception:
+                pass
+
+        # 3) Split into candidate sentences and filter
         candidates: List[str] = []
-        for c in contexts[:5]:
-            cleaned = _clean_for_summary(c)
-            for s in _split_sentences(cleaned):
+        for para in cleaned_contexts:
+            for s in _split_sentences(para):
                 w = s.split()
                 if not (8 <= len(w) <= 35):
                     continue
@@ -177,17 +189,17 @@ class SimpleRAG:
         if not candidates:
             return "The document appears largely tabular/numeric; couldn't extract readable sentences."
 
-        # 2) rank by similarity
+        # 4) Rank by similarity
         q_emb = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         cand_emb = self.model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         scores = (cand_emb @ q_emb.T).ravel()
         order = np.argsort(-scores)
 
-        # 3) near-duplicate dedup
+        # 5) Aggressive near-duplicate removal
         selected: List[str] = []
         for i in order:
             s = candidates[i].strip()
-            if any(_sim_jaccard(s, t) >= 0.82 for t in selected):
+            if any(_sim_jaccard(s, t) >= 0.90 for t in selected):
                 continue
             selected.append(s)
             if len(selected) >= max_sentences:
@@ -195,11 +207,6 @@ class SimpleRAG:
 
         if not selected:
             return "The document appears largely tabular/numeric; couldn't extract readable sentences."
-
-        # 4) translate to EN if needed
-        if OUTPUT_LANG == "en":
-            if any(_looks_azerbaijani(s) for s in selected):
-                selected = self._translate_to_en(selected)
 
         bullets = "\n".join(f"- {s}" for s in selected)
         return f"Answer (based on document context):\n{bullets}"
