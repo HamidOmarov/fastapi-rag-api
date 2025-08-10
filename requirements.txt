@@ -1,12 +1,8 @@
 fastapi
-uvicorn[standard]
-python-multipart
-pydantic==2.*
-pydantic-settings
+uvicorn
 sentence-transformers
-faiss-cpu
 pypdf
-python-dotenv
+faiss-cpu
 transformers>=4.40
 sentencepiece
 sacremoses
