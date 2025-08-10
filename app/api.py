@@ -68,12 +68,14 @@ async def upload_pdf(file: UploadFile = File(...)):
     added = rag.add_pdf(dest)
     return UploadResponse(filename=file.filename, chunks_added=added)
 
+# app/api.py içində ask_question endpoint
 @app.post("/ask_question", response_model=AskResponse)
 def ask_question(payload: AskRequest):
     hits = rag.search(payload.question, k=max(1, payload.top_k))
     contexts = [c for c, _ in hits]
+    # fallback: (optional) burda da son faylı ötürmək olar; synthesize_answer onsuz da edir:
     answer = rag.synthesize_answer(payload.question, contexts)
-    return AskResponse(answer=answer, contexts=contexts)
+    return AskResponse(answer=answer, contexts=contexts or rag.last_added[:5])
 
 @app.get("/get_history", response_model=HistoryResponse)
 def get_history():

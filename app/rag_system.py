@@ -23,6 +23,10 @@ OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").lower()
 
 AZ_CHARS = set("əğıöşçüİıĞÖŞÇÜƏ")
 NUM_TOK_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|set|mt)\b", re.IGNORECASE)
+GENERIC_Q_RE = re.compile(
+    r"(what\s+is\s+(it|this|the\s+document)\s+about\??|what\s+is\s+about\??|summary|overview)",
+    re.IGNORECASE,
+)
 
 def _split_sentences(text: str) -> List[str]:
     return [s.strip() for s in re.split(r'(?<=[.!?])\s+|[\r\n]+', text) if s.strip()]
@@ -36,7 +40,7 @@ def _mostly_numeric(s: str) -> bool:
 
 def _tabular_like(s: str) -> bool:
     hits = len(NUM_TOK_RE.findall(s))
-    return hits >= 3 or len(s) < 15
+    return hits >= 4 or len(s) < 15  # daha səxavətli
 
 def _clean_for_summary(text: str) -> str:
     out = []
@@ -75,21 +79,21 @@ def _keyword_summary_en(contexts: List[str]) -> List[str]:
         add("Wallpaper repair or replacement; some areas replaced with plaster and paint.")
     if ("alçı boya" in text) or ("boya işi" in text) or ("plaster" in text) or ("boya" in text):
         add("Wall plastering and painting works.")
-    if "seramik" in text:
+    if "seramik" in text or "ceramic" in text:
         add("Ceramic tiling works (including grouting).")
     if ("dilatasyon" in text) or ("ar 153" in text) or ("ar153" in text):
         add("Installation of AR 153–050 floor expansion joint profile with accessories and insulation.")
-    if "daş yunu" in text:
+    if "daş yunu" in text or "rock wool" in text:
         add("Rock wool insulation installed where required.")
-    if ("sütunlarda" in text) or ("üzlüyün" in text):
+    if ("sütunlarda" in text) or ("üzlüyün" in text) or ("cladding" in text):
         add("Repair of wall cladding on columns.")
-    if ("m²" in text) or ("ədəd" in text) or ("azn" in text):
+    if ("m²" in text) or ("ədəd" in text) or ("azn" in text) or ("unit price" in text):
         add("Bill of quantities style lines with unit prices and measures (m², pcs).")
 
     if not bullets:
         bullets = [
-            "The document appears to be a bill of quantities for renovation works.",
-            "Scope includes demolition/reinstallation, finishing (plaster & paint), tiling, and profiles.",
+            "The document appears to be a bill of quantities or a structured list of works.",
+            "Scope likely includes demolition/reinstallation, finishing (plaster & paint), tiling, and profiles.",
         ]
     return bullets[:5]
 
@@ -112,6 +116,7 @@ class SimpleRAG:
         self._translator = None  # lazy
         self.index: faiss.Index = faiss.IndexFlatIP(self.embed_dim)
         self.chunks: List[str] = []
+        self.last_added: List[str] = []  # son yüklənən faylın parçaları (RAM)
         self._load()
 
     def _load(self) -> None:
@@ -134,22 +139,39 @@ class SimpleRAG:
 
     @staticmethod
     def _pdf_to_texts(pdf_path: Path, step: int = 1400) -> List[str]:
-        reader = PdfReader(str(pdf_path))
+        # 1) pypdf
         pages: List[str] = []
-        for p in reader.pages:
-            t = p.extract_text() or ""
-            if t.strip():
-                pages.append(t)
+        try:
+            reader = PdfReader(str(pdf_path))
+            for p in reader.pages:
+                t = p.extract_text() or ""
+                if t.strip():
+                    pages.append(t)
+        except Exception:
+            pages = []
+
+        full = " ".join(pages).strip()
+        if not full:
+            # 2) pdfminer fallback
+            try:
+                from pdfminer.high_level import extract_text as pdfminer_extract_text
+                full = (pdfminer_extract_text(str(pdf_path)) or "").strip()
+            except Exception:
+                full = ""
+
+        if not full:
+            return []
+
         chunks: List[str] = []
-        for txt in pages:
-            for i in range(0, len(txt), step):
-                part = txt[i : i + step].strip()
-                if part:
-                    chunks.append(part)
+        for i in range(0, len(full), step):
+            part = full[i : i + step].strip()
+            if part:
+                chunks.append(part)
         return chunks
 
     def add_pdf(self, pdf_path: Path) -> int:
         texts = self._pdf_to_texts(pdf_path)
+        self.last_added = texts[:]  # son faylı yadda saxla (summarize fallback üçün)
         if not texts:
             return 0
         emb = self.model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
@@ -187,7 +209,17 @@ class SimpleRAG:
         except Exception:
             return texts
 
+    def _prepare_contexts(self, question: str, contexts: List[str]) -> List[str]:
+        # Generik sual və ya boş axtarış halında: son yüklənən fayldan istifadə et
+        generic = (len(question.split()) <= 5) or bool(GENERIC_Q_RE.search(question or ""))
+        if (not contexts or generic) and self.last_added:
+            base = self.last_added[:5]
+            return base
+        return contexts
+
     def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 4) -> str:
+        contexts = self._prepare_contexts(question, contexts)
+
         if not contexts:
             return "No relevant context found. Please upload a PDF or ask a more specific question."
 
@@ -195,27 +227,27 @@ class SimpleRAG:
         cleaned_contexts = [_clean_for_summary(c) for c in contexts[:5]]
         cleaned_contexts = [c for c in cleaned_contexts if len(c) > 40]
         if not cleaned_contexts:
-            return "The document appears largely tabular/numeric; couldn't extract readable sentences."
+            bullets = _keyword_summary_en(contexts[:5])
+            return "Answer (based on document context):\n" + "\n".join(f"- {b}" for b in bullets)
 
         # 2) Pre-translate paragraphs to EN when target is EN
         translated = self._translate_to_en(cleaned_contexts) if OUTPUT_LANG == "en" else cleaned_contexts
 
-        # 3) Split into candidate sentences and filter strictly for completeness
+        # 3) Split into candidate sentences and filter
         candidates: List[str] = []
         for para in translated:
             for s in _split_sentences(para):
                 w = s.split()
                 if not (6 <= len(w) <= 60):
                     continue
-                if s.strip().lower().endswith("e.g."):
-                    continue
-                if not re.search(r"[.!?](?:[\"'])?$", s):  # must end with punctuation
+                # tam cümlə tələbi (ya düzgün sonlu durğu, ya da kifayət qədər uzunluq)
+                if not re.search(r"[.!?](?:[\"'])?$", s) and len(w) < 18:
                     continue
                 if _tabular_like(s) or _mostly_numeric(s):
                     continue
                 candidates.append(" ".join(w))
 
-        # 4) Fallback if no good sentences
+        # 4) Fallback if no sentences
         if not candidates:
             bullets = _keyword_summary_en(cleaned_contexts)
             return "Answer (based on document context):\n" + "\n".join(f"- {b}" for b in bullets)
