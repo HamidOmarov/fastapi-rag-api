@@ -25,7 +25,7 @@ AZ_CHARS = set("əğıöşçüİıĞÖŞÇÜƏ")
 NUM_TOK_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|set|mt)\b", re.IGNORECASE)
 
 def _split_sentences(text: str) -> List[str]:
-    return [s.strip() for s in re.split(r'(?<=[\.\!\?])\s+|[\r\n]+', text) if s.strip()]
+    return [s.strip() for s in re.split(r'(?<=[.!?])\s+|[\r\n]+', text) if s.strip()]
 
 def _mostly_numeric(s: str) -> bool:
     alnum = [c for c in s if c.isalnum()]
@@ -36,7 +36,7 @@ def _mostly_numeric(s: str) -> bool:
 
 def _tabular_like(s: str) -> bool:
     hits = len(NUM_TOK_RE.findall(s))
-    return hits >= 2 or "Page" in s or len(s) < 20
+    return hits >= 3 or len(s) < 15
 
 def _clean_for_summary(text: str) -> str:
     out = []
@@ -46,11 +46,6 @@ def _clean_for_summary(text: str) -> str:
             continue
         out.append(t)
     return " ".join(out)
-
-def _norm_fingerprint(s: str) -> str:
-    s = s.lower()
-    s = "".join(ch for ch in s if ch.isalpha() or ch.isspace())
-    return " ".join(s.split())
 
 def _sim_jaccard(a: str, b: str) -> float:
     aw = set(a.lower().split())
@@ -68,7 +63,6 @@ def _non_ascii_ratio(s: str) -> float:
     return sum(ord(c) > 127 for c in s) / max(1, len(s))
 
 def _keyword_summary_en(contexts: List[str]) -> List[str]:
-    """English fallback: infer main items from keywords."""
     text = " ".join(contexts).lower()
     bullets: List[str] = []
     def add(b: str):
@@ -78,13 +72,13 @@ def _keyword_summary_en(contexts: List[str]) -> List[str]:
     if ("şüşə" in text) or ("ara kəsm" in text) or ("s/q" in text):
         add("Removal and re-installation of glass partitions in sanitary areas.")
     if "divar kağız" in text:
-        add("Wallpaper repair or replacement; in some areas replaced with plaster and paint.")
+        add("Wallpaper repair or replacement; some areas replaced with plaster and paint.")
     if ("alçı boya" in text) or ("boya işi" in text) or ("plaster" in text) or ("boya" in text):
         add("Wall plastering and painting works.")
     if "seramik" in text:
         add("Ceramic tiling works (including grouting).")
     if ("dilatasyon" in text) or ("ar 153" in text) or ("ar153" in text):
-        add("Installation of AR 153–050 floor expansion joint profile with required accessories and insulation.")
+        add("Installation of AR 153–050 floor expansion joint profile with accessories and insulation.")
     if "daş yunu" in text:
         add("Rock wool insulation installed where required.")
     if ("sütunlarda" in text) or ("üzlüyün" in text):
@@ -139,7 +133,7 @@ class SimpleRAG:
         np.save(self.meta_path, np.array(self.chunks, dtype=object))
 
     @staticmethod
-    def _pdf_to_texts(pdf_path: Path, step: int = 800) -> List[str]:
+    def _pdf_to_texts(pdf_path: Path, step: int = 1400) -> List[str]:
         reader = PdfReader(str(pdf_path))
         pages: List[str] = []
         for p in reader.pages:
@@ -203,35 +197,36 @@ class SimpleRAG:
         if not cleaned_contexts:
             return "The document appears largely tabular/numeric; couldn't extract readable sentences."
 
-        # 2) Try to pre-translate paragraphs to EN
-        if OUTPUT_LANG == "en":
-            translated = self._translate_to_en(cleaned_contexts)
-        else:
-            translated = cleaned_contexts
+        # 2) Pre-translate paragraphs to EN when target is EN
+        translated = self._translate_to_en(cleaned_contexts) if OUTPUT_LANG == "en" else cleaned_contexts
 
-        # 3) Split paragraphs into candidate sentences and filter
+        # 3) Split into candidate sentences and filter strictly for completeness
         candidates: List[str] = []
         for para in translated:
             for s in _split_sentences(para):
                 w = s.split()
-                if not (8 <= len(w) <= 35):
+                if not (6 <= len(w) <= 60):
+                    continue
+                if s.strip().lower().endswith("e.g."):
+                    continue
+                if not re.search(r"[.!?](?:[\"'])?$", s):  # must end with punctuation
                     continue
                 if _tabular_like(s) or _mostly_numeric(s):
                     continue
                 candidates.append(" ".join(w))
 
-        # 4) If we still don't have good EN sentences, fallback to keyword summary
+        # 4) Fallback if no good sentences
         if not candidates:
             bullets = _keyword_summary_en(cleaned_contexts)
             return "Answer (based on document context):\n" + "\n".join(f"- {b}" for b in bullets)
 
-        # 5) Rank by similarity
+        # 5) Rank by similarity to the question
         q_emb = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         cand_emb = self.model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         scores = (cand_emb @ q_emb.T).ravel()
         order = np.argsort(-scores)
 
-        # 6) Deduplicate (aggressive)
+        # 6) Aggressive near-duplicate removal
         selected: List[str] = []
         for i in order:
             s = candidates[i].strip()
@@ -241,7 +236,7 @@ class SimpleRAG:
             if len(selected) >= max_sentences:
                 break
 
-        # 7) If selected lines still look non-English, use keyword fallback
+        # 7) If still looks non-English, use keyword fallback
         if not selected or (sum(_non_ascii_ratio(s) for s in selected) / len(selected) > 0.10):
             bullets = _keyword_summary_en(cleaned_contexts)
             return "Answer (based on document context):\n" + "\n".join(f"- {b}" for b in bullets)
