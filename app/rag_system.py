@@ -32,7 +32,7 @@ def _split_sentences(text: str) -> List[str]:
     return [s.strip() for s in re.split(r'(?<=[.!?])\s+|[\r\n]+', text) if s.strip()]
 
 def _mostly_numeric(s: str) -> bool:
-    alnum = [c for c in s if c.isalnum()]
+    alnum = [c for c in s if s and c.isalnum()]
     if not alnum:
         return True
     digits = sum(c.isdigit() for c in alnum)
@@ -40,7 +40,7 @@ def _mostly_numeric(s: str) -> bool:
 
 def _tabular_like(s: str) -> bool:
     hits = len(NUM_TOK_RE.findall(s))
-    return hits >= 4 or len(s) < 15  # daha səxavətli
+    return hits >= 4 or len(s) < 15
 
 def _clean_for_summary(text: str) -> str:
     out = []
@@ -69,6 +69,7 @@ def _non_ascii_ratio(s: str) -> float:
 def _keyword_summary_en(contexts: List[str]) -> List[str]:
     text = " ".join(contexts).lower()
     bullets: List[str] = []
+
     def add(b: str):
         if b not in bullets:
             bullets.append(b)
@@ -116,7 +117,7 @@ class SimpleRAG:
         self._translator = None  # lazy
         self.index: faiss.Index = faiss.IndexFlatIP(self.embed_dim)
         self.chunks: List[str] = []
-        self.last_added: List[str] = []  # son yüklənən faylın parçaları (RAM)
+        self.last_added: List[str] = []
         self._load()
 
     def _load(self) -> None:
@@ -171,9 +172,11 @@ class SimpleRAG:
 
     def add_pdf(self, pdf_path: Path) -> int:
         texts = self._pdf_to_texts(pdf_path)
-        self.last_added = texts[:]  # son faylı yadda saxla (summarize fallback üçün)
         if not texts:
+            # IMPORTANT: do NOT clobber last_added if this PDF had no extractable text
             return 0
+
+        self.last_added = texts[:]  # only set if we actually extracted text
         emb = self.model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
         self.index.add(emb.astype(np.float32))
         self.chunks.extend(texts)
@@ -210,11 +213,10 @@ class SimpleRAG:
             return texts
 
     def _prepare_contexts(self, question: str, contexts: List[str]) -> List[str]:
-        # Generik sual və ya boş axtarış halında: son yüklənən fayldan istifadə et
-        generic = (len(question.split()) <= 5) or bool(GENERIC_Q_RE.search(question or ""))
+        # Generic question or empty search → use last uploaded file snippets
+        generic = (len((question or "").split()) <= 5) or bool(GENERIC_Q_RE.search(question or ""))
         if (not contexts or generic) and self.last_added:
-            base = self.last_added[:5]
-            return base
+            return self.last_added[:5]
         return contexts
 
     def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 4) -> str:
@@ -240,7 +242,7 @@ class SimpleRAG:
                 w = s.split()
                 if not (6 <= len(w) <= 60):
                     continue
-                # tam cümlə tələbi (ya düzgün sonlu durğu, ya da kifayət qədər uzunluq)
+                # full sentence requirement: punctuation at end OR sufficiently long
                 if not re.search(r"[.!?](?:[\"'])?$", s) and len(w) < 18:
                     continue
                 if _tabular_like(s) or _mostly_numeric(s):
