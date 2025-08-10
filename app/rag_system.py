@@ -19,18 +19,15 @@ for d in (DATA_DIR, UPLOAD_DIR, INDEX_DIR, CACHE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-
-# Output dili – EN üçün "en" saxla (default en)
 OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").lower()
 
-# --- util funksiyalar ---
-NUM_PAT = re.compile(r"(\d+([.,]\d+)?|%|m²|AZN|usd|eur|\bset\b|\bmt\b)", re.IGNORECASE)
+AZ_CHARS = set("əğıöşçüİıĞÖŞÇÜƏ")
+NUM_TOK_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|set|mt)\b", re.IGNORECASE)
 
 def _split_sentences(text: str) -> List[str]:
     return [s.strip() for s in re.split(r'(?<=[\.\!\?])\s+|[\r\n]+', text) if s.strip()]
 
 def _mostly_numeric(s: str) -> bool:
-    # daha aqressiv threshold
     alnum = [c for c in s if c.isalnum()]
     if not alnum:
         return True
@@ -38,20 +35,34 @@ def _mostly_numeric(s: str) -> bool:
     return digits / max(1, len(alnum)) > 0.3
 
 def _tabular_like(s: str) -> bool:
-    # rəqəmlər/ölçülər/valyuta bol olan sətirləri at
-    hits = len(NUM_PAT.findall(s))
+    hits = len(NUM_TOK_RE.findall(s))
     return hits >= 2 or "Page" in s or len(s) < 20
 
 def _clean_for_summary(text: str) -> str:
-    lines = []
+    out = []
     for ln in text.splitlines():
         t = " ".join(ln.split())
-        if not t:
+        if not t or _mostly_numeric(t) or _tabular_like(t):
             continue
-        if _mostly_numeric(t) or _tabular_like(t):
-            continue
-        lines.append(t)
-    return " ".join(lines)
+        out.append(t)
+    return " ".join(out)
+
+def _norm_fingerprint(s: str) -> str:
+    s = s.lower()
+    s = "".join(ch for ch in s if ch.isalpha() or ch.isspace())
+    return " ".join(s.split())
+
+def _sim_jaccard(a: str, b: str) -> float:
+    aw = set(a.lower().split())
+    bw = set(b.lower().split())
+    if not aw or not bw:
+        return 0.0
+    return len(aw & bw) / len(aw | bw)
+
+def _looks_azerbaijani(s: str) -> bool:
+    has_az = any(ch in AZ_CHARS for ch in s)
+    non_ascii_ratio = sum(ord(c) > 127 for c in s) / max(1, len(s))
+    return has_az or non_ascii_ratio > 0.15
 
 class SimpleRAG:
     def __init__(
@@ -69,32 +80,10 @@ class SimpleRAG:
         self.model = SentenceTransformer(self.model_name, cache_folder=str(self.cache_dir))
         self.embed_dim = self.model.get_sentence_embedding_dimension()
 
-        # translator lazy-load
-        self._translator = None
-
-        self.index: faiss.Index = None  # type: ignore
+        self._translator = None  # lazy
+        self.index: faiss.Index = faiss.IndexFlatIP(self.embed_dim)
         self.chunks: List[str] = []
         self._load()
-
-    # ---- translator (az->en) ----
-    def _translate_to_en(self, texts: List[str]) -> List[str]:
-        if OUTPUT_LANG != "en" or not texts:
-            return texts
-        try:
-            if self._translator is None:
-                from transformers import pipeline
-                # Helsinki-NLP az->en
-                self._translator = pipeline(
-                    "translation",
-                    model="Helsinki-NLP/opus-mt-az-en",
-                    cache_dir=str(self.cache_dir),
-                    device=-1,
-                )
-            outs = self._translator(texts, max_length=400)
-            return [o["translation_text"] for o in outs]
-        except Exception:
-            # tərcümə alınmasa, orijinalı qaytar
-            return texts
 
     def _load(self) -> None:
         if self.meta_path.exists():
@@ -105,11 +94,10 @@ class SimpleRAG:
         if self.index_path.exists():
             try:
                 idx = faiss.read_index(str(self.index_path))
-                self.index = idx if getattr(idx, "d", None) == self.embed_dim else faiss.IndexFlatIP(self.embed_dim)
+                if getattr(idx, "d", None) == self.embed_dim:
+                    self.index = idx
             except Exception:
-                self.index = faiss.IndexFlatIP(self.embed_dim)
-        else:
-            self.index = faiss.IndexFlatIP(self.embed_dim)
+                pass
 
     def _persist(self) -> None:
         faiss.write_index(self.index, str(self.index_path))
@@ -118,7 +106,7 @@ class SimpleRAG:
     @staticmethod
     def _pdf_to_texts(pdf_path: Path, step: int = 800) -> List[str]:
         reader = PdfReader(str(pdf_path))
-        pages = []
+        pages: List[str] = []
         for p in reader.pages:
             t = p.extract_text() or ""
             if t.strip():
@@ -126,7 +114,7 @@ class SimpleRAG:
         chunks: List[str] = []
         for txt in pages:
             for i in range(0, len(txt), step):
-                part = txt[i:i+step].strip()
+                part = txt[i : i + step].strip()
                 if part:
                     chunks.append(part)
         return chunks
@@ -153,36 +141,52 @@ class SimpleRAG:
                     out.append((self.chunks[idx], float(score)))
         return out
 
+    def _translate_to_en(self, texts: List[str]) -> List[str]:
+        if not texts:
+            return texts
+        try:
+            from transformers import pipeline
+            if self._translator is None:
+                self._translator = pipeline(
+                    "translation",
+                    model="Helsinki-NLP/opus-mt-az-en",
+                    cache_dir=str(self.cache_dir),
+                    device=-1,
+                )
+            outs = self._translator(texts, max_length=400)
+            return [o["translation_text"].strip() for o in outs]
+        except Exception:
+            return texts
+
     def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 4) -> str:
         if not contexts:
             return "No relevant context found. Please upload a PDF or ask a more specific question."
 
-        # 1) Candidate sentence-lər (aggressive clean)
-         candidates: List[str] = []
+        # 1) candidates (aggressive clean)
+        candidates: List[str] = []
         for c in contexts[:5]:
-             cleaned = _clean_for_summary(c)
+            cleaned = _clean_for_summary(c)
             for s in _split_sentences(cleaned):
-                # uzunluq və keyfiyyət filtrləri
                 w = s.split()
                 if not (8 <= len(w) <= 35):
-                   continue
+                    continue
                 if _tabular_like(s) or _mostly_numeric(s):
-                   continue
-                candidates.append(" ".join(w))  # normalizasiya: bir boşluq
+                    continue
+                candidates.append(" ".join(w))
 
         if not candidates:
             return "The document appears largely tabular/numeric; couldn't extract readable sentences."
 
-        # 2) Oxşarlığa görə sıralama
+        # 2) rank by similarity
         q_emb = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         cand_emb = self.model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         scores = (cand_emb @ q_emb.T).ravel()
         order = np.argsort(-scores)
 
-        # 3) Near-duplicate dedup (Jaccard söz seti) – threshold 0.82
+        # 3) near-duplicate dedup
         selected: List[str] = []
         for i in order:
-        s = candidates[i].strip()
+            s = candidates[i].strip()
             if any(_sim_jaccard(s, t) >= 0.82 for t in selected):
                 continue
             selected.append(s)
@@ -192,22 +196,15 @@ class SimpleRAG:
         if not selected:
             return "The document appears largely tabular/numeric; couldn't extract readable sentences."
 
-        # 4) HƏMİŞƏ EN tərcümə (istəyin belədir)
-        if os.getenv("OUTPUT_LANG", "en").lower() == "en":
-            selected = self._translate_to_en(selected)
+        # 4) translate to EN if needed
+        if OUTPUT_LANG == "en":
+            if any(_looks_azerbaijani(s) for s in selected):
+                selected = self._translate_to_en(selected)
 
         bullets = "\n".join(f"- {s}" for s in selected)
         return f"Answer (based on document context):\n{bullets}"
 
-def _sim_jaccard(a: str, b: str) -> float:
-    aw = set(a.lower().split())
-    bw = set(b.lower().split())
-    if not aw or not bw:
-        return 0.0
-    return len(aw & bw) / len(aw | bw)
-
 def synthesize_answer(question: str, contexts: List[str]) -> str:
     return SimpleRAG().synthesize_answer(question, contexts)
-
 
 __all__ = ["SimpleRAG", "synthesize_answer", "DATA_DIR", "UPLOAD_DIR", "INDEX_DIR", "CACHE_DIR", "MODEL_NAME"]
