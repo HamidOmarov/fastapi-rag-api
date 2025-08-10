@@ -32,12 +32,12 @@ def health():
 async def upload_pdf(file: UploadFile = File(...)):
     try:
         if not file.filename.lower().endswith(".pdf"):
-            http400("Yalnız PDF faylları qəbul olunur.")
+            http400("Only PDF files are accepted.")
         dest = UPLOAD_DIR / file.filename
         with dest.open("wb") as f:
             shutil.copyfileobj(file.file, f)
         chunks_added = rag.add_pdf(dest)
-        return UploadResponse(filename=file.filename, chunks_added=chunks_added)
+        return JSONResponse(status_code=500, content={"detail": f"Server error: {str(e)}"})
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"detail": f"Server xətası: {str(e)}"})

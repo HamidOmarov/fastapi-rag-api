@@ -1,7 +1,7 @@
 # app/rag_system.py
 from __future__ import annotations
 
-import os
+import os, re
 from pathlib import Path
 from typing import List, Tuple
 
@@ -10,32 +10,47 @@ import numpy as np
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
-
-# -----------------------------
-# Konfiqurasiya & qovluqlar
-# -----------------------------
+# Paths & caches
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 INDEX_DIR = DATA_DIR / "index"
-
-# HF Spaces-də yazma icazəsi olan cache qovluğu
 CACHE_DIR = Path(os.getenv("HF_HOME", str(ROOT_DIR / ".cache")))
 for d in (DATA_DIR, UPLOAD_DIR, INDEX_DIR, CACHE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-# Model adı ENV-dən dəyişdirilə bilər
 MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
+def _split_sentences(text: str) -> List[str]:
+    # Split by sentence end or newlines
+    return [s.strip() for s in re.split(r'(?<=[\.\!\?])\s+|[\r\n]+', text) if s.strip()]
+
+def _mostly_numeric(s: str) -> bool:
+    alnum = [c for c in s if c.isalnum()]
+    if not alnum:
+        return True
+    digits = sum(c.isdigit() for c in alnum)
+    return digits / len(alnum) > 0.5
+
+def _clean_for_summary(text: str) -> str:
+    # Drop lines that are mostly numbers / too short
+    lines = []
+    for ln in text.splitlines():
+        t = " ".join(ln.split())
+        if len(t) < 10:
+            continue
+        if _mostly_numeric(t):
+            continue
+        lines.append(t)
+    return " ".join(lines)
 
 class SimpleRAG:
     """
-    Sadə RAG nüvəsi:
-    - PDF -> mətn parçalama
-    - Sentence-Transformers embeddings
-    - FAISS Index (IP / cosine bərabərləşdirilmiş)
+    - PDF -> text chunking
+    - Sentence-Transformers embeddings (cosine/IP)
+    - FAISS index
+    - Extractive answer in EN
     """
-
     def __init__(
         self,
         index_path: Path = INDEX_DIR / "faiss.index",
@@ -48,39 +63,23 @@ class SimpleRAG:
         self.model_name = model_name
         self.cache_dir = Path(cache_dir)
 
-        # Model
-        # cache_folder Spaces-də /.cache icazə xətasının qarşısını alır
         self.model = SentenceTransformer(self.model_name, cache_folder=str(self.cache_dir))
         self.embed_dim = self.model.get_sentence_embedding_dimension()
 
-        # FAISS index və meta (chunks)
         self.index: faiss.Index = None  # type: ignore
         self.chunks: List[str] = []
-
         self._load()
 
-    # -----------------------------
-    # Yükləmə / Saxlama
-    # -----------------------------
     def _load(self) -> None:
-        # Chunks (meta) yüklə
         if self.meta_path.exists():
             try:
                 self.chunks = np.load(self.meta_path, allow_pickle=True).tolist()
             except Exception:
-                # zədələnmişsə sıfırla
                 self.chunks = []
-
-        # FAISS index yüklə
         if self.index_path.exists():
             try:
                 idx = faiss.read_index(str(self.index_path))
-                # ölçü uyğunluğunu yoxla
-                if hasattr(idx, "d") and idx.d == self.embed_dim:
-                    self.index = idx
-                else:
-                    # uyğunsuzluqda sıfırdan qur
-                    self.index = faiss.IndexFlatIP(self.embed_dim)
+                self.index = idx if getattr(idx, "d", None) == self.embed_dim else faiss.IndexFlatIP(self.embed_dim)
             except Exception:
                 self.index = faiss.IndexFlatIP(self.embed_dim)
         else:
@@ -90,96 +89,88 @@ class SimpleRAG:
         faiss.write_index(self.index, str(self.index_path))
         np.save(self.meta_path, np.array(self.chunks, dtype=object))
 
-    # -----------------------------
-    # PDF -> Mətn -> Parçalama
-    # -----------------------------
     @staticmethod
     def _pdf_to_texts(pdf_path: Path, step: int = 800) -> List[str]:
         reader = PdfReader(str(pdf_path))
-        pages_text: List[str] = []
-        for page in reader.pages:
-            t = page.extract_text() or ""
+        pages = []
+        for p in reader.pages:
+            t = p.extract_text() or ""
             if t.strip():
-                pages_text.append(t)
-
+                pages.append(t)
         chunks: List[str] = []
-        for txt in pages_text:
+        for txt in pages:
             for i in range(0, len(txt), step):
-                chunk = txt[i : i + step].strip()
-                if chunk:
-                    chunks.append(chunk)
+                part = txt[i:i+step].strip()
+                if part:
+                    chunks.append(part)
         return chunks
 
-    # -----------------------------
-    # Index-ə əlavə
-    # -----------------------------
     def add_pdf(self, pdf_path: Path) -> int:
         texts = self._pdf_to_texts(pdf_path)
         if not texts:
             return 0
-
-        emb = self.model.encode(
-            texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False
-        )
-        # FAISS-ə əlavə
+        emb = self.model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
         self.index.add(emb.astype(np.float32))
-        # Meta-ya əlavə
         self.chunks.extend(texts)
-        # Diskə yaz
         self._persist()
         return len(texts)
 
-    # -----------------------------
-    # Axtarış
-    # -----------------------------
     def search(self, query: str, k: int = 5) -> List[Tuple[str, float]]:
-        if self.index is None:
+        if self.index is None or self.index.ntotal == 0:
             return []
-
-        q = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
-        # FAISS float32 gözləyir
-        D, I = self.index.search(q.astype(np.float32), min(k, max(1, self.index.ntotal)))
-        results: List[Tuple[str, float]] = []
-
+        q = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+        D, I = self.index.search(q, min(k, max(1, self.index.ntotal)))
+        out: List[Tuple[str, float]] = []
         if I.size > 0 and self.chunks:
             for idx, score in zip(I[0], D[0]):
                 if 0 <= idx < len(self.chunks):
-                    results.append((self.chunks[idx], float(score)))
-        return results
+                    out.append((self.chunks[idx], float(score)))
+        return out
 
-    # -----------------------------
-    # Cavab Sinttezi (LLM-siz demo)
-    # -----------------------------
-    def synthesize_answer(self, question: str, contexts: List[str]) -> str:
+    # -------- Improved English answer --------
+    def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 5) -> str:
         if not contexts:
-            return "Kontekst tapılmadı. Sualı daha dəqiq verin və ya PDF yükləyin."
-        joined = "\n---\n".join(contexts[:3])
-        return (
-            f"Sual: {question}\n\n"
-            f"Cavab (kontekstdən çıxarış):\n{joined}\n\n"
-            f"(Qeyd: Demo rejimi — LLM inteqrasiyası üçün sonradan OpenAI/Groq və s. əlavə edilə bilər.)"
-        )
+            return "No relevant context found. Please upload a PDF or ask a more specific question."
+
+        # Prepare candidate sentences
+        candidates: List[str] = []
+        for c in contexts[:5]:
+            cleaned = _clean_for_summary(c)
+            for s in _split_sentences(cleaned):
+                if 20 <= len(s) <= 240 and not _mostly_numeric(s):
+                    candidates.append(s)
+
+        # Fallback if still nothing
+        if not candidates:
+            return "The document appears to be mostly tabular/numeric; no clear sentences to summarize."
+
+        # Rank candidates by cosine similarity to the question
+        q_emb = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+        cand_emb = self.model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+        scores = (cand_emb @ q_emb.T).ravel()
+        order = np.argsort(-scores)
+
+        # Pick top sentences with simple de-dup
+        selected: List[str] = []
+        seen = set()
+        for i in order:
+            s = candidates[i].strip()
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(s)
+            if len(selected) >= max_sentences:
+                break
+
+        bullet = "\n".join(f"- {s}" for s in selected)
+        note = " (The PDF seems largely tabular; extracted the most relevant lines.)" if all(_mostly_numeric(c) for c in contexts) else ""
+        return f"Answer (based on document context):\n{bullet}{note}"
 
 
-# Köhnə import yolunu dəstəkləmək üçün eyni funksiyanı modul səviyyəsində də saxlayırıq
+# Module-level alias
 def synthesize_answer(question: str, contexts: List[str]) -> str:
-    if not contexts:
-        return "Kontekst tapılmadı. Sualı daha dəqiq verin və ya PDF yükləyin."
-    joined = "\n---\n".join(contexts[:3])
-    return (
-        f"Sual: {question}\n\n"
-        f"Cavab (kontekstdən çıxarış):\n{joined}\n\n"
-        f"(Qeyd: Demo rejimi — LLM inteqrasiyası üçün sonradan OpenAI/Groq və s. əlavə edilə bilər.)"
-    )
+    return SimpleRAG().synthesize_answer(question, contexts)
 
 
-# Faylı import edən tərəfin rahatlığı üçün bu qovluqları export edirik
-__all__ = [
-    "SimpleRAG",
-    "synthesize_answer",
-    "DATA_DIR",
-    "UPLOAD_DIR",
-    "INDEX_DIR",
-    "CACHE_DIR",
-    "MODEL_NAME",
-]
+__all__ = ["SimpleRAG", "synthesize_answer", "DATA_DIR", "UPLOAD_DIR", "INDEX_DIR", "CACHE_DIR", "MODEL_NAME"]
