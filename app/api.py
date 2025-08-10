@@ -1,13 +1,14 @@
 # app/api.py
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from typing import List, Optional
 
-from .rag_system import SimpleRAG, UPLOAD_DIR, synthesize_answer as summarize
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel
 
-app = FastAPI(title="RAG API", version="1.2.2")
+from .rag_system import SimpleRAG, UPLOAD_DIR
+
+app = FastAPI(title="RAG API", version="1.2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,7 +20,23 @@ app.add_middleware(
 
 rag = SimpleRAG()
 
-# --- Debug: translator test ---
+# ---------- Models ----------
+class UploadResponse(BaseModel):
+    filename: str
+    chunks_added: int
+
+class AskRequest(BaseModel):
+    question: str
+    top_k: int = 5
+
+class AskResponse(BaseModel):
+    answer: str
+    contexts: List[str]
+
+class HistoryResponse(BaseModel):
+    total_chunks: int
+
+# ---------- Debug ----------
 @app.get("/debug/translate")
 def debug_translate():
     try:
@@ -30,75 +47,34 @@ def debug_translate():
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
-# ... qalan endpointlər (health, upload_pdf, ask_question, get_history) buradan sonra gəlir ...
-
-
-
-from .rag_system import SimpleRAG, UPLOAD_DIR, synthesize_answer as summarize
-from .schemas import AskRequest, AskResponse, UploadResponse, HistoryResponse, HistoryItem
-from .store import add_history, get_history
-from .utils import ensure_session, http400
-
-app = FastAPI(title="RAG API", version="1.1.0")
-
-# CORS (allow Streamlit or any origin; tighten later if you want)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # e.g., ["https://HamidOmarov-RAG-Dashboard.hf.space"]
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-rag = SimpleRAG()
-
+# ---------- Core ----------
 @app.get("/")
 def root():
-    # convenience: open docs instead of 404
     return RedirectResponse(url="/docs")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.1.0", "summarizer": "extractive_en"}
+    return {"status": "ok", "version": app.version, "summarizer": "extractive_en+translate+fallback"}
 
 @app.post("/upload_pdf", response_model=UploadResponse)
 async def upload_pdf(file: UploadFile = File(...)):
-    try:
-        if not file.filename.lower().endswith(".pdf"):
-            http400("Only PDF files are accepted.")
-        dest: Path = UPLOAD_DIR / file.filename
-        with dest.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
-        chunks_added = rag.add_pdf(dest)
-        return UploadResponse(filename=file.filename, chunks_added=chunks_added)
-    except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"detail": f"Server error: {str(e)}"})
+    dest = UPLOAD_DIR / file.filename
+    with open(dest, "wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+    added = rag.add_pdf(dest)
+    return UploadResponse(filename=file.filename, chunks_added=added)
 
 @app.post("/ask_question", response_model=AskResponse)
-async def ask_question(payload: AskRequest):
-    try:
-        session_id = ensure_session(payload.session_id)
-        add_history(session_id, "user", payload.question)
-
-        results = rag.search(payload.question, k=payload.top_k)
-        contexts = [c for c, _ in results]
-
-        # Always use the English extractive summarizer
-        answer = summarize(payload.question, contexts)
-
-        add_history(session_id, "assistant", answer)
-        return AskResponse(answer=answer, contexts=contexts, session_id=session_id)
-    except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"detail": f"Server error: {str(e)}"})
+def ask_question(payload: AskRequest):
+    hits = rag.search(payload.question, k=max(1, payload.top_k))
+    contexts = [c for c, _ in hits]
+    answer = rag.synthesize_answer(payload.question, contexts)
+    return AskResponse(answer=answer, contexts=contexts)
 
 @app.get("/get_history", response_model=HistoryResponse)
-async def get_history_endpoint(session_id: str):
-    try:
-        hist_raw = get_history(session_id)
-        history = [HistoryItem(**h) for h in hist_raw]
-        return HistoryResponse(session_id=session_id, history=history)
-    except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"detail": f"Server error: {str(e)}"})
+def get_history():
+    return HistoryResponse(total_chunks=len(rag.chunks))
