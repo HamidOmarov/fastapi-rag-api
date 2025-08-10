@@ -10,7 +10,6 @@ import numpy as np
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
-# Paths & caches
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -21,36 +20,40 @@ for d in (DATA_DIR, UPLOAD_DIR, INDEX_DIR, CACHE_DIR):
 
 MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
+# Output dili – EN üçün "en" saxla (default en)
+OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").lower()
+
+# --- util funksiyalar ---
+NUM_PAT = re.compile(r"(\d+([.,]\d+)?|%|m²|AZN|usd|eur|\bset\b|\bmt\b)", re.IGNORECASE)
+
 def _split_sentences(text: str) -> List[str]:
-    # Split by sentence end or newlines
     return [s.strip() for s in re.split(r'(?<=[\.\!\?])\s+|[\r\n]+', text) if s.strip()]
 
 def _mostly_numeric(s: str) -> bool:
+    # daha aqressiv threshold
     alnum = [c for c in s if c.isalnum()]
     if not alnum:
         return True
     digits = sum(c.isdigit() for c in alnum)
-    return digits / len(alnum) > 0.5
+    return digits / max(1, len(alnum)) > 0.3
+
+def _tabular_like(s: str) -> bool:
+    # rəqəmlər/ölçülər/valyuta bol olan sətirləri at
+    hits = len(NUM_PAT.findall(s))
+    return hits >= 2 or "Page" in s or len(s) < 20
 
 def _clean_for_summary(text: str) -> str:
-    # Drop lines that are mostly numbers / too short
     lines = []
     for ln in text.splitlines():
         t = " ".join(ln.split())
-        if len(t) < 10:
+        if not t:
             continue
-        if _mostly_numeric(t):
+        if _mostly_numeric(t) or _tabular_like(t):
             continue
         lines.append(t)
     return " ".join(lines)
 
 class SimpleRAG:
-    """
-    - PDF -> text chunking
-    - Sentence-Transformers embeddings (cosine/IP)
-    - FAISS index
-    - Extractive answer in EN
-    """
     def __init__(
         self,
         index_path: Path = INDEX_DIR / "faiss.index",
@@ -66,9 +69,32 @@ class SimpleRAG:
         self.model = SentenceTransformer(self.model_name, cache_folder=str(self.cache_dir))
         self.embed_dim = self.model.get_sentence_embedding_dimension()
 
+        # translator lazy-load
+        self._translator = None
+
         self.index: faiss.Index = None  # type: ignore
         self.chunks: List[str] = []
         self._load()
+
+    # ---- translator (az->en) ----
+    def _translate_to_en(self, texts: List[str]) -> List[str]:
+        if OUTPUT_LANG != "en" or not texts:
+            return texts
+        try:
+            if self._translator is None:
+                from transformers import pipeline
+                # Helsinki-NLP az->en
+                self._translator = pipeline(
+                    "translation",
+                    model="Helsinki-NLP/opus-mt-az-en",
+                    cache_dir=str(self.cache_dir),
+                    device=-1,
+                )
+            outs = self._translator(texts, max_length=400)
+            return [o["translation_text"] for o in outs]
+        except Exception:
+            # tərcümə alınmasa, orijinalı qaytar
+            return texts
 
     def _load(self) -> None:
         if self.meta_path.exists():
@@ -127,30 +153,28 @@ class SimpleRAG:
                     out.append((self.chunks[idx], float(score)))
         return out
 
-    # -------- Improved English answer --------
     def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 5) -> str:
         if not contexts:
             return "No relevant context found. Please upload a PDF or ask a more specific question."
 
-        # Prepare candidate sentences
+        # Candidate sentences (clean + split)
         candidates: List[str] = []
         for c in contexts[:5]:
             cleaned = _clean_for_summary(c)
             for s in _split_sentences(cleaned):
-                if 20 <= len(s) <= 240 and not _mostly_numeric(s):
+                if 40 <= len(s) <= 240 and not _tabular_like(s):
                     candidates.append(s)
 
-        # Fallback if still nothing
         if not candidates:
-            return "The document appears to be mostly tabular/numeric; no clear sentences to summarize."
+            return "The document appears largely tabular/numeric; couldn't extract readable sentences."
 
-        # Rank candidates by cosine similarity to the question
+        # Rank by similarity
         q_emb = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         cand_emb = self.model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         scores = (cand_emb @ q_emb.T).ravel()
         order = np.argsort(-scores)
 
-        # Pick top sentences with simple de-dup
+        # Pick top sentences with dedup by lowercase
         selected: List[str] = []
         seen = set()
         for i in order:
@@ -163,12 +187,14 @@ class SimpleRAG:
             if len(selected) >= max_sentences:
                 break
 
-        bullet = "\n".join(f"- {s}" for s in selected)
-        note = " (The PDF seems largely tabular; extracted the most relevant lines.)" if all(_mostly_numeric(c) for c in contexts) else ""
-        return f"Answer (based on document context):\n{bullet}{note}"
+        # Translate to EN if needed
+        if OUTPUT_LANG == "en":
+            selected = self._translate_to_en(selected)
+
+        bullets = "\n".join(f"- {s}" for s in selected)
+        return f"Answer (based on document context):\n{bullets}"
 
 
-# Module-level alias
 def synthesize_answer(question: str, contexts: List[str]) -> str:
     return SimpleRAG().synthesize_answer(question, contexts)
 

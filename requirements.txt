@@ -7,3 +7,6 @@ sentence-transformers
 faiss-cpu
 pypdf
 python-dotenv
+transformers>=4.40
+sentencepiece
+sacremoses
