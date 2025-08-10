@@ -5,6 +5,19 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pathlib import Path
 import shutil
 import traceback
+# app/api.py (importların altından)
+from fastapi.responses import JSONResponse
+
+@app.get("/debug/translate")
+def debug_translate():
+    try:
+        from transformers import pipeline
+        tr = pipeline("translation", model="Helsinki-NLP/opus-mt-az-en", cache_dir=str(CACHE_DIR), device=-1)
+        out = tr("Sənəd təmiri və quraşdırılması ilə bağlı işlər görülüb.", max_length=80)[0]["translation_text"]
+        return {"ok": True, "example_in": "Sənəd təmiri və quraşdırılması ilə bağlı işlər görülüb.", "example_out": out}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
 
 from .rag_system import SimpleRAG, UPLOAD_DIR, synthesize_answer as summarize
 from .schemas import AskRequest, AskResponse, UploadResponse, HistoryResponse, HistoryItem

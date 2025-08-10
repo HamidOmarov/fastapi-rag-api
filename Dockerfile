@@ -14,7 +14,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
  && rm -rf /var/lib/apt/lists/*
 
-# Bust pip cache layer when requirements change
+# Bust pip cache when requirements change
 ARG CACHEBUST=20250810
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

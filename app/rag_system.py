@@ -114,7 +114,7 @@ class SimpleRAG:
         chunks: List[str] = []
         for txt in pages:
             for i in range(0, len(txt), step):
-                part = txt[i:i+step].strip()
+                part = txt[i : i + step].strip()
                 if part:
                     chunks.append(part)
         return chunks
@@ -162,20 +162,20 @@ class SimpleRAG:
         if not contexts:
             return "No relevant context found. Please upload a PDF or ask a more specific question."
 
-        # 1) Clean & keep top contexts
+        # 1) Clean top contexts
         cleaned_contexts = [_clean_for_summary(c) for c in contexts[:5]]
         cleaned_contexts = [c for c in cleaned_contexts if len(c) > 40]
         if not cleaned_contexts:
             return "The document appears largely tabular/numeric; couldn't extract readable sentences."
 
-        # 2) Pre-translate paragraphs to EN (if output language is EN)
+        # 2) Pre-translate paragraphs to EN (if target is EN)
         if OUTPUT_LANG == "en":
             try:
                 cleaned_contexts = self._translate_to_en(cleaned_contexts)
             except Exception:
                 pass
 
-        # 3) Split into candidate sentences and filter
+        # 3) Split into sentence candidates & filter
         candidates: List[str] = []
         for para in cleaned_contexts:
             for s in _split_sentences(para):
@@ -189,13 +189,13 @@ class SimpleRAG:
         if not candidates:
             return "The document appears largely tabular/numeric; couldn't extract readable sentences."
 
-        # 4) Rank by similarity
+        # 4) Rank by similarity to question
         q_emb = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         cand_emb = self.model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         scores = (cand_emb @ q_emb.T).ravel()
         order = np.argsort(-scores)
 
-        # 5) Aggressive near-duplicate removal
+        # 5) Aggressive near-duplicate removal (Jaccard >= 0.90)
         selected: List[str] = []
         for i in order:
             s = candidates[i].strip()
