@@ -153,47 +153,58 @@ class SimpleRAG:
                     out.append((self.chunks[idx], float(score)))
         return out
 
-    def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 5) -> str:
+    def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 4) -> str:
         if not contexts:
             return "No relevant context found. Please upload a PDF or ask a more specific question."
 
-        # Candidate sentences (clean + split)
-        candidates: List[str] = []
+        # 1) Candidate sentence-lər (aggressive clean)
+         candidates: List[str] = []
         for c in contexts[:5]:
-            cleaned = _clean_for_summary(c)
+             cleaned = _clean_for_summary(c)
             for s in _split_sentences(cleaned):
-                if 40 <= len(s) <= 240 and not _tabular_like(s):
-                    candidates.append(s)
+                # uzunluq və keyfiyyət filtrləri
+                w = s.split()
+                if not (8 <= len(w) <= 35):
+                   continue
+                if _tabular_like(s) or _mostly_numeric(s):
+                   continue
+                candidates.append(" ".join(w))  # normalizasiya: bir boşluq
 
         if not candidates:
             return "The document appears largely tabular/numeric; couldn't extract readable sentences."
 
-        # Rank by similarity
+        # 2) Oxşarlığa görə sıralama
         q_emb = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         cand_emb = self.model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
         scores = (cand_emb @ q_emb.T).ravel()
         order = np.argsort(-scores)
 
-        # Pick top sentences with dedup by lowercase
+        # 3) Near-duplicate dedup (Jaccard söz seti) – threshold 0.82
         selected: List[str] = []
-        seen = set()
         for i in order:
-            s = candidates[i].strip()
-            key = s.lower()
-            if key in seen:
+        s = candidates[i].strip()
+            if any(_sim_jaccard(s, t) >= 0.82 for t in selected):
                 continue
-            seen.add(key)
             selected.append(s)
             if len(selected) >= max_sentences:
                 break
 
-        # Translate to EN if needed
-        if OUTPUT_LANG == "en":
+        if not selected:
+            return "The document appears largely tabular/numeric; couldn't extract readable sentences."
+
+        # 4) HƏMİŞƏ EN tərcümə (istəyin belədir)
+        if os.getenv("OUTPUT_LANG", "en").lower() == "en":
             selected = self._translate_to_en(selected)
 
         bullets = "\n".join(f"- {s}" for s in selected)
         return f"Answer (based on document context):\n{bullets}"
 
+def _sim_jaccard(a: str, b: str) -> float:
+    aw = set(a.lower().split())
+    bw = set(b.lower().split())
+    if not aw or not bw:
+        return 0.0
+    return len(aw & bw) / len(aw | bw)
 
 def synthesize_answer(question: str, contexts: List[str]) -> str:
     return SimpleRAG().synthesize_answer(question, contexts)
