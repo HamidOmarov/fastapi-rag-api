@@ -17,12 +17,14 @@ except Exception:
 
 from sentence_transformers import SentenceTransformer
 
-# ---------------- Paths & Cache ----------------
-ROOT_DIR = Path(__file__).resolve().parent
-DATA_DIR = ROOT_DIR / "data"
-UPLOAD_DIR = DATA_DIR / "uploads"
-INDEX_DIR = DATA_DIR / "index"
-CACHE_DIR = Path(os.getenv("HF_HOME", str(ROOT_DIR / ".cache")))
+# ---------------- Paths & Cache (HF-safe) ----------------
+# Writeable base is /app in HF Spaces. Allow ENV overrides.
+ROOT_DIR = Path(os.getenv("APP_ROOT", "/app"))
+DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT_DIR / "data")))
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads")))
+INDEX_DIR = Path(os.getenv("INDEX_DIR", str(DATA_DIR / "index")))
+CACHE_DIR = Path(os.getenv("HF_HOME", str(ROOT_DIR / ".cache")))  # transformers prefers HF_HOME
+
 for d in (DATA_DIR, UPLOAD_DIR, INDEX_DIR, CACHE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
@@ -45,7 +47,6 @@ def _fix_mojibake(s: str) -> str:
     return s
 
 def _split_sentences(text: str) -> List[str]:
-    # Split on punctuation boundaries and line breaks
     return [s.strip() for s in re.split(r"(?<=[\.!\?])\s+|[\r\n]+", text) if s.strip()]
 
 def _mostly_numeric(s: str) -> bool:
@@ -206,7 +207,6 @@ class SimpleRAG:
 
     # ---------- Fallbacks ----------
     def _keyword_fallback(self, question: str, pool: List[str], limit_sentences: int = 4) -> List[str]:
-        """Pick sentences sharing keywords with the question (question-dependent even if dense retrieval is weak)."""
         qk = set(_keywords(question))
         if not qk:
             return []
@@ -237,7 +237,6 @@ class SimpleRAG:
 
     # ---------- Answer Synthesis ----------
     def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 4) -> str:
-        """Extractive summary over retrieved contexts; falls back to keyword selection; EN translation if needed."""
         if not contexts and self.is_empty:
             return "No relevant context found. Index is empty — upload a PDF first."
 
@@ -246,7 +245,7 @@ class SimpleRAG:
 
         # Build candidate sentences from nearby contexts
         local_pool: List[str] = []
-        for c in (contexts or [])[:5]:  # keep it light
+        for c in (contexts or [])[:5]:
             cleaned = _clean_for_summary(c)
             for s in _split_sentences(cleaned):
                 w = s.split()
@@ -270,15 +269,13 @@ class SimpleRAG:
                 if len(selected) >= max_sentences:
                     break
 
-        # Keyword fallback if needed
         if not selected:
             selected = self._keyword_fallback(question, self.chunks, limit_sentences=max_sentences)
 
         if not selected:
             return "No readable sentences matched the question. Try a more specific query."
 
-        # Translate to EN if looks AZ and OUTPUT_LANG = en
-        if OUTPUT_LANG == "en" and any(_looks_azerbaijani(s) for s in selected):
+        if OUTPUT_LANG == "en" and any(ord(ch) > 127 for ch in " ".join(selected)):
             selected = self._translate_to_en(selected)
 
         bullets = "\n".join(f"- {s}" for s in selected)
