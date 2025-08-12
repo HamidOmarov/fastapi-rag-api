@@ -8,55 +8,36 @@ from typing import List, Tuple
 
 import faiss
 import numpy as np
+from ftfy import fix_text
 
-# --- ftfy (mojibake/normalizasiya) ---
-try:
-    from ftfy import fix_text as _ftfy
-except Exception:  # ftfy yoxdursa, no-op
-    def _ftfy(x: str) -> str:
-        return x
-
-# pypdf -> PyPDF2 fallback
+# Prefer pypdf; fallback to PyPDF2 if needed
 try:
     from pypdf import PdfReader
-except Exception:
+except Exception:  # pragma: no cover
     from PyPDF2 import PdfReader  # type: ignore
 
 from sentence_transformers import SentenceTransformer
 
-# ---------------- Paths & Cache (HF-safe) ----------------
-# Default: repo kökü; APP_ROOT verilərsə ona keç
-DEFAULT_ROOT = Path(__file__).resolve().parents[1]
-ROOT_DIR = Path(os.getenv("APP_ROOT", str(DEFAULT_ROOT)))
+
+# ===================== Paths & Cache (HF-safe) =====================
+# Writable base in HF Spaces is /app. Allow ENV overrides for local runs.
+ROOT_DIR = Path(os.getenv("APP_ROOT", "/app"))
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT_DIR / "data")))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads")))
 INDEX_DIR = Path(os.getenv("INDEX_DIR", str(DATA_DIR / "index")))
-CACHE_DIR = Path(os.getenv("HF_HOME", str(ROOT_DIR / ".cache")))  # transformers üçün ən yaxşısı HF_HOME
+CACHE_DIR = Path(os.getenv("HF_HOME", str(ROOT_DIR / ".cache")))  # transformers prefers HF_HOME
 
-# cəhd et yaratmağa; icazə problemi olsa, local ./data-a düş
-for pth in (CACHE_DIR,):
-    try:
-        pth.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        pass
+for d in (DATA_DIR, UPLOAD_DIR, INDEX_DIR, CACHE_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
-try:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
-except PermissionError:
-    DATA_DIR = Path("./data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
-    UPLOAD_DIR = DATA_DIR / "uploads"; UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    INDEX_DIR = DATA_DIR / "index"; INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------- Config ----------------
+# ============================= Config ==============================
 MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").lower()
 
-# ---------------- Helpers ----------------
+
+# ============================ Helpers ==============================
 AZ_CHARS = set("əğıöşçüİıĞÖŞÇÜƏ")
-AZ_LATIN = "A-Za-zƏəĞğİıÖöŞşÇç"
-_SINGLE_LETTER_RUN = re.compile(rf"\b(?:[{AZ_LATIN}]\s+){{2,}}[{AZ_LATIN}]\b")
 NUM_TOKEN_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|set|mt)\b", re.IGNORECASE)
 
 STOPWORDS = {
@@ -66,14 +47,17 @@ STOPWORDS = {
     "such","can","could","should","would","may","might","will","shall"
 }
 
-def _fix_intra_word_spaces(s: str) -> str:
-    """'c l a s s' → 'class', 'H Ə F T Ə' → 'HƏFTƏ' (yalnız ardıcıl tək-hərflər)."""
-    if not s:
-        return s
-    return _SINGLE_LETTER_RUN.sub(lambda m: re.sub(r"\s+", "", m.group(0)), s)
+AZ_LATIN = "A-Za-zƏəĞğİıÖöŞşÇç"
+_SINGLE_LETTER_RUN = re.compile(rf"\b(?:[{AZ_LATIN}]\s+){{2,}}[{AZ_LATIN}]\b")
+
+KEYWORD_HINTS = [
+    "descoped", "out of scope", "exclude", "excluded", "scope change",
+    "çıxar", "çıxarılan", "daxil deyil", "kənar", "silin", "dəyişiklik",
+]
+
 
 def _fix_mojibake(s: str) -> str:
-    """UTF-8-in Latin-1 kimi oxunmasından yaranan 'Ã¶' və s. pozuntuları yumşaq düzəlt."""
+    """Fix common UTF-8-as-Latin-1 mojibake artifacts."""
     if not s:
         return s
     if any(ch in s for ch in ("Ã", "Ä", "Å", "Ð", "Þ", "þ")):
@@ -83,19 +67,39 @@ def _fix_mojibake(s: str) -> str:
             return s
     return s
 
+
+def _fix_intra_word_spaces(s: str) -> str:
+    """Join sequences like 'H Ə F T Ə' -> 'HƏFTƏ' without touching normal words."""
+    if not s:
+        return s
+    return _SINGLE_LETTER_RUN.sub(lambda m: re.sub(r"\s+", "", m.group(0)), s)
+
+
+def _fix_word_breaks(s: str) -> str:
+    """Repair hyphen/newline word-breaks and collapse excessive spaces."""
+    s = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", s)  # join hyphen breaks
+    return re.sub(r"[ \t]+", " ", s)
+
+
 def _split_sentences(text: str) -> List[str]:
-    return [s.strip() for s in re.split(r"(?<=[\.!\?])\s+|[\r\n]+", text) if s.strip()]
+    # sentence-ish splitter that also breaks on line breaks
+    return [s.strip() for s in re.split(r'(?<=[\.\!\?])\s+|[\r\n]+', text) if s.strip()]
+
 
 def _mostly_numeric(s: str) -> bool:
+    """Treat a line as numeric/tabular if >60% of alnum chars are digits."""
     alnum = [c for c in s if c.isalnum()]
     if not alnum:
         return True
     digits = sum(c.isdigit() for c in alnum)
-    return digits / max(1, len(alnum)) > 0.3
+    return digits / max(1, len(alnum)) > 0.6
+
 
 def _tabular_like(s: str) -> bool:
+    """Heuristic for table-ish lines; relax threshold so we don't drop everything."""
     hits = len(NUM_TOKEN_RE.findall(s))
-    return hits >= 2 or "Page" in s or len(s) < 20
+    return hits >= 3  # was 2; set to 3 to be less aggressive
+
 
 def _clean_for_summary(text: str) -> str:
     out = []
@@ -106,6 +110,7 @@ def _clean_for_summary(text: str) -> str:
         out.append(t)
     return " ".join(out)
 
+
 def _sim_jaccard(a: str, b: str) -> float:
     aw = set(a.lower().split())
     bw = set(b.lower().split())
@@ -113,16 +118,37 @@ def _sim_jaccard(a: str, b: str) -> float:
         return 0.0
     return len(aw & bw) / len(aw | bw)
 
+
 def _keywords(text: str) -> List[str]:
     toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", text.lower())
     return [t for t in toks if t not in STOPWORDS and len(t) > 2]
+
 
 def _looks_azerbaijani(s: str) -> bool:
     has_az = any(ch in AZ_CHARS for ch in s)
     non_ascii_ratio = sum(ord(c) > 127 for c in s) / max(1, len(s))
     return has_az or non_ascii_ratio > 0.15
 
-# ---------------- RAG Core ----------------
+
+def _extract_keyword_lines(question: str, pool: List[str], limit: int = 6) -> List[str]:
+    """Directly lift lines containing descoped/scope-change hints."""
+    keys = set(_keywords(question)) | {k.lower() for k in KEYWORD_HINTS}
+    hits: List[str] = []
+    for text in pool[:200]:
+        t = fix_text(_fix_intra_word_spaces(_fix_word_breaks(_fix_mojibake(text))))
+        for line in t.splitlines():
+            s = " ".join(line.split())
+            if not s or len(s.split()) < 4:
+                continue
+            lo = s.lower()
+            if any(k in lo for k in keys):
+                hits.append(s)
+                if len(hits) >= limit:
+                    return hits
+    return hits
+
+
+# ============================ RAG Core =============================
 class SimpleRAG:
     def __init__(
         self,
@@ -176,13 +202,13 @@ class SimpleRAG:
         pages: List[str] = []
         for p in reader.pages:
             t = p.extract_text() or ""
-            # normalizasiya ardıcıllığı
-            t = _ftfy(t)
-            t = _fix_mojibake(t)
-            t = _fix_intra_word_spaces(t)
-            t = re.sub(r"\s+", " ", t).strip()
-            if t:
+            if t.strip():
+                t = _fix_mojibake(t)
+                t = fix_text(t)
+                t = _fix_word_breaks(t)
+                t = _fix_intra_word_spaces(t)
                 pages.append(t)
+
         chunks: List[str] = []
         for txt in pages:
             for i in range(0, len(txt), step):
@@ -272,15 +298,12 @@ class SimpleRAG:
         if not contexts and self.is_empty:
             return "No relevant context found. Index is empty — upload a PDF first."
 
-        # konteksləri də təmizlə
-        contexts = [
-            re.sub(r"\s+", " ", _fix_intra_word_spaces(_fix_mojibake(_ftfy(c)))).strip()
-            for c in (contexts or [])
-        ]
+        # Fix mojibake in contexts, normalize spacing
+        contexts = [fix_text(_fix_intra_word_spaces(_fix_word_breaks(_fix_mojibake(c or "")))) for c in (contexts or [])]
 
-        # Yaxın kontekstlərdən namizədlər
+        # Build candidate sentences from nearby contexts (use more windows)
         local_pool: List[str] = []
-        for c in (contexts or [])[:5]:
+        for c in (contexts or [])[:8]:
             cleaned = _clean_for_summary(c)
             for s in _split_sentences(cleaned):
                 w = s.split()
@@ -304,13 +327,18 @@ class SimpleRAG:
                 if len(selected) >= max_sentences:
                     break
 
+        # keyword-based sentence-level selection across corpus
         if not selected:
             selected = self._keyword_fallback(question, self.chunks, limit_sentences=max_sentences)
+
+        # final direct-line extraction if still empty
+        if not selected:
+            selected = _extract_keyword_lines(question, self.chunks, limit=max_sentences)
 
         if not selected:
             return "No readable sentences matched the question. Try a more specific query."
 
-        # EN istəyə uyğun tərcümə
+        # translate to EN if needed
         if OUTPUT_LANG == "en" and any(ord(ch) > 127 for ch in " ".join(selected)):
             selected = self._translate_to_en(selected)
 
