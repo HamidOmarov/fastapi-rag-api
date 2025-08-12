@@ -4,51 +4,57 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import faiss
 import numpy as np
+from ftfy import fix_text
 
-# -- add near other helpers --
-import re
+# Prefer pypdf; fallback to PyPDF2
+try:
+    from pypdf import PdfReader
+except Exception:  # pragma: no cover
+    from PyPDF2 import PdfReader  # type: ignore
+
+from sentence_transformers import SentenceTransformer
+
+# ===================== Paths (HF-safe) =====================
+# HF Spaces üçün yazıla bilən baza /app-dir. Lokal mühitdə də işləyir.
+ROOT_DIR = Path(os.getenv("APP_ROOT", "/app"))
+DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT_DIR / "data")))
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads")))
+INDEX_DIR = Path(os.getenv("INDEX_DIR", str(DATA_DIR / "index")))
+CACHE_DIR = Path(os.getenv("HF_HOME", str(ROOT_DIR / ".cache")))
+
+for d in (DATA_DIR, UPLOAD_DIR, INDEX_DIR, CACHE_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+# ===================== Config =====================
+MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").lower()
+
+# ===================== Helpers =====================
+AZ_CHARS = set("əğıöşçüİıĞÖŞÇÜƏ")
+NUM_TOKEN_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|set|mt)\b", re.IGNORECASE)
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "by",
+    "this", "that", "these", "those", "is", "are", "was", "were", "be", "been", "being",
+    "at", "as", "it", "its", "from", "into", "about", "over", "after", "before", "than",
+    "such", "can", "could", "should", "would", "may", "might", "will", "shall"
+}
 
 AZ_LATIN = "A-Za-zƏəĞğİıÖöŞşÇç"
 _SINGLE_LETTER_RUN = re.compile(rf"\b(?:[{AZ_LATIN}]\s+){{2,}}[{AZ_LATIN}]\b")
 
 def _fix_intra_word_spaces(s: str) -> str:
-    """Join sequences like 'H Ə F T Ə' -> 'HƏFTƏ' without touching normal words."""
+    """'H Ə F T Ə' → 'HƏFTƏ' (yalnız ardıcıl tək-hərf qaçışlarını birləşdirir)."""
     if not s:
         return s
     return _SINGLE_LETTER_RUN.sub(lambda m: re.sub(r"\s+", "", m.group(0)), s)
 
-# Prefer pypdf; fallback to PyPDF2 if needed
-try:
-    from pypdf import PdfReader
-except Exception:
-    from PyPDF2 import PdfReader  # type: ignore
-
-from sentence_transformers import SentenceTransformer
-
-# ---------------- Paths & Cache (HF-safe) ----------------
-# Writeable base is /app in HF Spaces. Allow ENV overrides.
-ROOT_DIR = Path(os.getenv("APP_ROOT", "/app"))
-DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT_DIR / "data")))
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads")))
-INDEX_DIR = Path(os.getenv("INDEX_DIR", str(DATA_DIR / "index")))
-CACHE_DIR = Path(os.getenv("HF_HOME", str(ROOT_DIR / ".cache")))  # transformers prefers HF_HOME
-
-for d in (DATA_DIR, UPLOAD_DIR, INDEX_DIR, CACHE_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-# ---------------- Config ----------------
-MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").lower()
-
-# ---------------- Helpers ----------------
-AZ_CHARS = set("əğıöşçüİıĞÖŞÇÜƏ")
-
 def _fix_mojibake(s: str) -> str:
-    """Fix common UTF-8-as-Latin-1 mojibake."""
+    """UTF-8-as-Latin1 tipik mojibake üçün sürətli həll."""
     if not s:
         return s
     if any(ch in s for ch in ("Ã", "Ä", "Å", "Ð", "Þ", "þ")):
@@ -58,6 +64,17 @@ def _fix_mojibake(s: str) -> str:
             return s
     return s
 
+def _normalize_text(s: str) -> str:
+    if not s:
+        return s
+    s = fix_text(s)                 # ftfy ilə ümumi düzəlişlər
+    s = _fix_mojibake(s)            # latin-1 → utf-8 “çevrilməsi” cəhd
+    s = s.replace("ﬁ", "fi").replace("ﬂ", "fl")
+    s = _fix_intra_word_spaces(s)   # H Ə F T Ə → HƏFTƏ
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\s+\n", "\n", s)
+    return s.strip()
+
 def _split_sentences(text: str) -> List[str]:
     return [s.strip() for s in re.split(r"(?<=[\.!\?])\s+|[\r\n]+", text) if s.strip()]
 
@@ -66,9 +83,7 @@ def _mostly_numeric(s: str) -> bool:
     if not alnum:
         return True
     digits = sum(c.isdigit() for c in alnum)
-    return digits / max(1, len(alnum)) > 0.3
-
-NUM_TOKEN_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|set|mt)\b", re.IGNORECASE)
+    return digits / max(1, len(alnum)) > 0.30
 
 def _tabular_like(s: str) -> bool:
     hits = len(NUM_TOKEN_RE.findall(s))
@@ -78,7 +93,11 @@ def _clean_for_summary(text: str) -> str:
     out = []
     for ln in text.splitlines():
         t = " ".join(ln.split())
-        if not t or _mostly_numeric(t) or _tabular_like(t):
+        if not t:
+            continue
+        if len(t) < 25:
+            continue
+        if _mostly_numeric(t) or _tabular_like(t):
             continue
         out.append(t)
     return " ".join(out)
@@ -90,13 +109,6 @@ def _sim_jaccard(a: str, b: str) -> float:
         return 0.0
     return len(aw & bw) / len(aw | bw)
 
-STOPWORDS = {
-    "the","a","an","and","or","of","to","in","on","for","with","by",
-    "this","that","these","those","is","are","was","were","be","been","being",
-    "at","as","it","its","from","into","about","over","after","before","than",
-    "such","can","could","should","would","may","might","will","shall"
-}
-
 def _keywords(text: str) -> List[str]:
     toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", text.lower())
     return [t for t in toks if t not in STOPWORDS and len(t) > 2]
@@ -106,7 +118,7 @@ def _looks_azerbaijani(s: str) -> bool:
     non_ascii_ratio = sum(ord(c) > 127 for c in s) / max(1, len(s))
     return has_az or non_ascii_ratio > 0.15
 
-# ---------------- RAG Core ----------------
+# ===================== RAG Core =====================
 class SimpleRAG:
     def __init__(
         self,
@@ -126,7 +138,7 @@ class SimpleRAG:
         self.index: faiss.Index = faiss.IndexFlatIP(self.embed_dim)
         self.chunks: List[str] = []
         self.last_added: List[str] = []
-        self._translator = None  # lazy init
+        self._translator = None  # lazy
 
         self._load()
 
@@ -160,16 +172,26 @@ class SimpleRAG:
         pages: List[str] = []
         for p in reader.pages:
             t = p.extract_text() or ""
-            t = _fix_mojibake(t)
             if t.strip():
+                t = _normalize_text(t)
                 pages.append(t)
+
         chunks: List[str] = []
         for txt in pages:
             for i in range(0, len(txt), step):
-                part = txt[i : i + step].strip()
+                part = txt[i: i + step].strip()
                 if part:
                     chunks.append(part)
-        return chunks
+
+        # simple dedup to avoid exact repeats
+        seen = set()
+        uniq: List[str] = []
+        for c in chunks:
+            if c in seen:
+                continue
+            seen.add(c)
+            uniq.append(c)
+        return uniq
 
     # ---------- Indexing ----------
     def add_pdf(self, pdf_path: Path) -> int:
@@ -252,10 +274,10 @@ class SimpleRAG:
         if not contexts and self.is_empty:
             return "No relevant context found. Index is empty — upload a PDF first."
 
-        # Fix mojibake in contexts
-        contexts = [_fix_mojibake(c) for c in (contexts or [])]
+        # normalize contexts (mojibake, spacing, etc.)
+        contexts = [_normalize_text(c) for c in (contexts or [])]
 
-        # Build candidate sentences from nearby contexts
+        # 1) local candidate pool
         local_pool: List[str] = []
         for c in (contexts or [])[:5]:
             cleaned = _clean_for_summary(c)
@@ -267,6 +289,7 @@ class SimpleRAG:
                     continue
                 local_pool.append(" ".join(w))
 
+        # 2) rank by similarity to question
         selected: List[str] = []
         if local_pool:
             q_emb = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
@@ -281,20 +304,21 @@ class SimpleRAG:
                 if len(selected) >= max_sentences:
                     break
 
+        # 3) keyword fallback (whole corpus) əgər nəticə zəifdirsə
         if not selected:
             selected = self._keyword_fallback(question, self.chunks, limit_sentences=max_sentences)
 
         if not selected:
             return "No readable sentences matched the question. Try a more specific query."
 
-        if OUTPUT_LANG == "en" and any(ord(ch) > 127 for ch in " ".join(selected)):
+        # 4) translate to EN if needed
+        if OUTPUT_LANG == "en" and any(_looks_azerbaijani(s) for s in selected):
             selected = self._translate_to_en(selected)
 
         bullets = "\n".join(f"- {s}" for s in selected)
         return f"Answer (based on document context):\n{bullets}"
 
 
-# Public API
 __all__ = [
     "SimpleRAG",
     "UPLOAD_DIR",
