@@ -9,6 +9,18 @@ from typing import List, Tuple, Optional
 import faiss
 import numpy as np
 
+# -- add near other helpers --
+import re
+
+AZ_LATIN = "A-Za-zƏəĞğİıÖöŞşÇç"
+_SINGLE_LETTER_RUN = re.compile(rf"\b(?:[{AZ_LATIN}]\s+){{2,}}[{AZ_LATIN}]\b")
+
+def _fix_intra_word_spaces(s: str) -> str:
+    """Join sequences like 'H Ə F T Ə' -> 'HƏFTƏ' without touching normal words."""
+    if not s:
+        return s
+    return _SINGLE_LETTER_RUN.sub(lambda m: re.sub(r"\s+", "", m.group(0)), s)
+
 # Prefer pypdf; fallback to PyPDF2 if needed
 try:
     from pypdf import PdfReader
