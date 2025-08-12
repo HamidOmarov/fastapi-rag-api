@@ -1,16 +1,24 @@
 # app/rag_system.py
 from __future__ import annotations
 
-import os, re
+import os
+import re
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import faiss
 import numpy as np
-from pypdf import PdfReader
+
+# Prefer pypdf; fallback to PyPDF2 if needed
+try:
+    from pypdf import PdfReader
+except Exception:
+    from PyPDF2 import PdfReader  # type: ignore
+
 from sentence_transformers import SentenceTransformer
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+# ---------------- Paths & Cache ----------------
+ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 INDEX_DIR = DATA_DIR / "index"
@@ -18,29 +26,40 @@ CACHE_DIR = Path(os.getenv("HF_HOME", str(ROOT_DIR / ".cache")))
 for d in (DATA_DIR, UPLOAD_DIR, INDEX_DIR, CACHE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+# ---------------- Config ----------------
 MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").lower()
 
+# ---------------- Helpers ----------------
 AZ_CHARS = set("əğıöşçüİıĞÖŞÇÜƏ")
-NUM_TOK_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|set|mt)\b", re.IGNORECASE)
-GENERIC_Q_RE = re.compile(
-    r"(what\s+is\s+(it|this|the\s+document)\s+about\??|what\s+is\s+about\??|summary|overview)",
-    re.IGNORECASE,
-)
+
+def _fix_mojibake(s: str) -> str:
+    """Fix common UTF-8-as-Latin-1 mojibake."""
+    if not s:
+        return s
+    if any(ch in s for ch in ("Ã", "Ä", "Å", "Ð", "Þ", "þ")):
+        try:
+            return s.encode("latin-1", "ignore").decode("utf-8", "ignore")
+        except Exception:
+            return s
+    return s
 
 def _split_sentences(text: str) -> List[str]:
-    return [s.strip() for s in re.split(r'(?<=[.!?])\s+|[\r\n]+', text) if s.strip()]
+    # Split on punctuation boundaries and line breaks
+    return [s.strip() for s in re.split(r"(?<=[\.!\?])\s+|[\r\n]+", text) if s.strip()]
 
 def _mostly_numeric(s: str) -> bool:
-    alnum = [c for c in s if s and c.isalnum()]
+    alnum = [c for c in s if c.isalnum()]
     if not alnum:
         return True
     digits = sum(c.isdigit() for c in alnum)
     return digits / max(1, len(alnum)) > 0.3
 
+NUM_TOKEN_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|set|mt)\b", re.IGNORECASE)
+
 def _tabular_like(s: str) -> bool:
-    hits = len(NUM_TOK_RE.findall(s))
-    return hits >= 4 or len(s) < 15
+    hits = len(NUM_TOKEN_RE.findall(s))
+    return hits >= 2 or "Page" in s or len(s) < 20
 
 def _clean_for_summary(text: str) -> str:
     out = []
@@ -58,46 +77,23 @@ def _sim_jaccard(a: str, b: str) -> float:
         return 0.0
     return len(aw & bw) / len(aw | bw)
 
+STOPWORDS = {
+    "the","a","an","and","or","of","to","in","on","for","with","by",
+    "this","that","these","those","is","are","was","were","be","been","being",
+    "at","as","it","its","from","into","about","over","after","before","than",
+    "such","can","could","should","would","may","might","will","shall"
+}
+
+def _keywords(text: str) -> List[str]:
+    toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", text.lower())
+    return [t for t in toks if t not in STOPWORDS and len(t) > 2]
+
 def _looks_azerbaijani(s: str) -> bool:
     has_az = any(ch in AZ_CHARS for ch in s)
     non_ascii_ratio = sum(ord(c) > 127 for c in s) / max(1, len(s))
     return has_az or non_ascii_ratio > 0.15
 
-def _non_ascii_ratio(s: str) -> float:
-    return sum(ord(c) > 127 for c in s) / max(1, len(s))
-
-def _keyword_summary_en(contexts: List[str]) -> List[str]:
-    text = " ".join(contexts).lower()
-    bullets: List[str] = []
-
-    def add(b: str):
-        if b not in bullets:
-            bullets.append(b)
-
-    if ("şüşə" in text) or ("ara kəsm" in text) or ("s/q" in text):
-        add("Removal and re-installation of glass partitions in sanitary areas.")
-    if "divar kağız" in text:
-        add("Wallpaper repair or replacement; some areas replaced with plaster and paint.")
-    if ("alçı boya" in text) or ("boya işi" in text) or ("plaster" in text) or ("boya" in text):
-        add("Wall plastering and painting works.")
-    if "seramik" in text or "ceramic" in text:
-        add("Ceramic tiling works (including grouting).")
-    if ("dilatasyon" in text) or ("ar 153" in text) or ("ar153" in text):
-        add("Installation of AR 153–050 floor expansion joint profile with accessories and insulation.")
-    if "daş yunu" in text or "rock wool" in text:
-        add("Rock wool insulation installed where required.")
-    if ("sütunlarda" in text) or ("üzlüyün" in text) or ("cladding" in text):
-        add("Repair of wall cladding on columns.")
-    if ("m²" in text) or ("ədəd" in text) or ("azn" in text) or ("unit price" in text):
-        add("Bill of quantities style lines with unit prices and measures (m², pcs).")
-
-    if not bullets:
-        bullets = [
-            "The document appears to be a bill of quantities or a structured list of works.",
-            "Scope likely includes demolition/reinstallation, finishing (plaster & paint), tiling, and profiles.",
-        ]
-    return bullets[:5]
-
+# ---------------- RAG Core ----------------
 class SimpleRAG:
     def __init__(
         self,
@@ -112,14 +108,16 @@ class SimpleRAG:
         self.cache_dir = Path(cache_dir)
 
         self.model = SentenceTransformer(self.model_name, cache_folder=str(self.cache_dir))
-        self.embed_dim = self.model.get_sentence_embedding_dimension()
+        self.embed_dim = int(self.model.get_sentence_embedding_dimension())
 
-        self._translator = None  # lazy
         self.index: faiss.Index = faiss.IndexFlatIP(self.embed_dim)
         self.chunks: List[str] = []
         self.last_added: List[str] = []
+        self._translator = None  # lazy init
+
         self._load()
 
+    # ---------- Persistence ----------
     def _load(self) -> None:
         if self.meta_path.exists():
             try:
@@ -138,56 +136,49 @@ class SimpleRAG:
         faiss.write_index(self.index, str(self.index_path))
         np.save(self.meta_path, np.array(self.chunks, dtype=object))
 
+    # ---------- Utilities ----------
+    @property
+    def is_empty(self) -> bool:
+        return getattr(self.index, "ntotal", 0) == 0 or not self.chunks
+
     @staticmethod
-    def _pdf_to_texts(pdf_path: Path, step: int = 1400) -> List[str]:
-        # 1) pypdf
+    def _pdf_to_texts(pdf_path: Path, step: int = 800) -> List[str]:
+        reader = PdfReader(str(pdf_path))
         pages: List[str] = []
-        try:
-            reader = PdfReader(str(pdf_path))
-            for p in reader.pages:
-                t = p.extract_text() or ""
-                if t.strip():
-                    pages.append(t)
-        except Exception:
-            pages = []
-
-        full = " ".join(pages).strip()
-        if not full:
-            # 2) pdfminer fallback
-            try:
-                from pdfminer.high_level import extract_text as pdfminer_extract_text
-                full = (pdfminer_extract_text(str(pdf_path)) or "").strip()
-            except Exception:
-                full = ""
-
-        if not full:
-            return []
-
+        for p in reader.pages:
+            t = p.extract_text() or ""
+            t = _fix_mojibake(t)
+            if t.strip():
+                pages.append(t)
         chunks: List[str] = []
-        for i in range(0, len(full), step):
-            part = full[i : i + step].strip()
-            if part:
-                chunks.append(part)
+        for txt in pages:
+            for i in range(0, len(txt), step):
+                part = txt[i : i + step].strip()
+                if part:
+                    chunks.append(part)
         return chunks
 
+    # ---------- Indexing ----------
     def add_pdf(self, pdf_path: Path) -> int:
         texts = self._pdf_to_texts(pdf_path)
         if not texts:
-            # IMPORTANT: do NOT clobber last_added if this PDF had no extractable text
             return 0
-
-        self.last_added = texts[:]  # only set if we actually extracted text
-        emb = self.model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
+        emb = self.model.encode(
+            texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False
+        )
         self.index.add(emb.astype(np.float32))
         self.chunks.extend(texts)
+        self.last_added = texts[:]
         self._persist()
         return len(texts)
 
+    # ---------- Search ----------
     def search(self, query: str, k: int = 5) -> List[Tuple[str, float]]:
-        if self.index is None or self.index.ntotal == 0:
+        if self.is_empty:
             return []
         q = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-        D, I = self.index.search(q, min(k, max(1, self.index.ntotal)))
+        k = max(1, min(int(k or 5), getattr(self.index, "ntotal", 1)))
+        D, I = self.index.search(q, k)
         out: List[Tuple[str, float]] = []
         if I.size > 0 and self.chunks:
             for idx, score in zip(I[0], D[0]):
@@ -195,6 +186,7 @@ class SimpleRAG:
                     out.append((self.chunks[idx], float(score)))
         return out
 
+    # ---------- Translation (optional) ----------
     def _translate_to_en(self, texts: List[str]) -> List[str]:
         if not texts:
             return texts
@@ -207,78 +199,95 @@ class SimpleRAG:
                     cache_dir=str(self.cache_dir),
                     device=-1,
                 )
-            outs = self._translator(texts, max_length=800)
+            outs = self._translator(texts, max_length=400)
             return [o["translation_text"].strip() for o in outs]
         except Exception:
             return texts
 
-    def _prepare_contexts(self, question: str, contexts: List[str]) -> List[str]:
-        # Generic question or empty search → use last uploaded file snippets
-        generic = (len((question or "").split()) <= 5) or bool(GENERIC_Q_RE.search(question or ""))
-        if (not contexts or generic) and self.last_added:
-            return self.last_added[:5]
-        return contexts
-
-    def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 4) -> str:
-        contexts = self._prepare_contexts(question, contexts)
-
-        if not contexts:
-            return "No relevant context found. Please upload a PDF or ask a more specific question."
-
-        # 1) Clean & keep top contexts
-        cleaned_contexts = [_clean_for_summary(c) for c in contexts[:5]]
-        cleaned_contexts = [c for c in cleaned_contexts if len(c) > 40]
-        if not cleaned_contexts:
-            bullets = _keyword_summary_en(contexts[:5])
-            return "Answer (based on document context):\n" + "\n".join(f"- {b}" for b in bullets)
-
-        # 2) Pre-translate paragraphs to EN when target is EN
-        translated = self._translate_to_en(cleaned_contexts) if OUTPUT_LANG == "en" else cleaned_contexts
-
-        # 3) Split into candidate sentences and filter
-        candidates: List[str] = []
-        for para in translated:
-            for s in _split_sentences(para):
-                w = s.split()
-                if not (6 <= len(w) <= 60):
+    # ---------- Fallbacks ----------
+    def _keyword_fallback(self, question: str, pool: List[str], limit_sentences: int = 4) -> List[str]:
+        """Pick sentences sharing keywords with the question (question-dependent even if dense retrieval is weak)."""
+        qk = set(_keywords(question))
+        if not qk:
+            return []
+        candidates: List[Tuple[float, str]] = []
+        for text in pool[:200]:
+            cleaned = _clean_for_summary(text)
+            for s in _split_sentences(cleaned):
+                if _tabular_like(s) or _mostly_numeric(s):
                     continue
-                # full sentence requirement: punctuation at end OR sufficiently long
-                if not re.search(r"[.!?](?:[\"'])?$", s) and len(w) < 18:
+                toks = set(_keywords(s))
+                if not toks:
+                    continue
+                overlap = len(qk & toks)
+                if overlap == 0:
+                    continue
+                length_penalty = max(8, min(40, len(s.split())))
+                score = overlap + min(0.5, overlap / length_penalty)
+                candidates.append((score, s))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        out: List[str] = []
+        for _, s in candidates:
+            if any(_sim_jaccard(s, t) >= 0.82 for t in out):
+                continue
+            out.append(s)
+            if len(out) >= limit_sentences:
+                break
+        return out
+
+    # ---------- Answer Synthesis ----------
+    def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 4) -> str:
+        """Extractive summary over retrieved contexts; falls back to keyword selection; EN translation if needed."""
+        if not contexts and self.is_empty:
+            return "No relevant context found. Index is empty — upload a PDF first."
+
+        # Fix mojibake in contexts
+        contexts = [_fix_mojibake(c) for c in (contexts or [])]
+
+        # Build candidate sentences from nearby contexts
+        local_pool: List[str] = []
+        for c in (contexts or [])[:5]:  # keep it light
+            cleaned = _clean_for_summary(c)
+            for s in _split_sentences(cleaned):
+                w = s.split()
+                if not (8 <= len(w) <= 35):
                     continue
                 if _tabular_like(s) or _mostly_numeric(s):
                     continue
-                candidates.append(" ".join(w))
+                local_pool.append(" ".join(w))
 
-        # 4) Fallback if no sentences
-        if not candidates:
-            bullets = _keyword_summary_en(cleaned_contexts)
-            return "Answer (based on document context):\n" + "\n".join(f"- {b}" for b in bullets)
-
-        # 5) Rank by similarity to the question
-        q_emb = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-        cand_emb = self.model.encode(candidates, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-        scores = (cand_emb @ q_emb.T).ravel()
-        order = np.argsort(-scores)
-
-        # 6) Aggressive near-duplicate removal
         selected: List[str] = []
-        for i in order:
-            s = candidates[i].strip()
-            if any(_sim_jaccard(s, t) >= 0.90 for t in selected):
-                continue
-            selected.append(s)
-            if len(selected) >= max_sentences:
-                break
+        if local_pool:
+            q_emb = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+            cand_emb = self.model.encode(local_pool, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+            scores = (cand_emb @ q_emb.T).ravel()
+            order = np.argsort(-scores)
+            for i in order:
+                s = local_pool[i].strip()
+                if any(_sim_jaccard(s, t) >= 0.82 for t in selected):
+                    continue
+                selected.append(s)
+                if len(selected) >= max_sentences:
+                    break
 
-        # 7) If still looks non-English, use keyword fallback
-        if not selected or (sum(_non_ascii_ratio(s) for s in selected) / len(selected) > 0.10):
-            bullets = _keyword_summary_en(cleaned_contexts)
-            return "Answer (based on document context):\n" + "\n".join(f"- {b}" for b in bullets)
+        # Keyword fallback if needed
+        if not selected:
+            selected = self._keyword_fallback(question, self.chunks, limit_sentences=max_sentences)
+
+        if not selected:
+            return "No readable sentences matched the question. Try a more specific query."
+
+        # Translate to EN if looks AZ and OUTPUT_LANG = en
+        if OUTPUT_LANG == "en" and any(_looks_azerbaijani(s) for s in selected):
+            selected = self._translate_to_en(selected)
 
         bullets = "\n".join(f"- {s}" for s in selected)
         return f"Answer (based on document context):\n{bullets}"
 
-def synthesize_answer(question: str, contexts: List[str]) -> str:
-    return SimpleRAG().synthesize_answer(question, contexts)
 
-__all__ = ["SimpleRAG", "synthesize_answer", "DATA_DIR", "UPLOAD_DIR", "INDEX_DIR", "CACHE_DIR", "MODEL_NAME"]
+# Public API
+__all__ = [
+    "SimpleRAG",
+    "UPLOAD_DIR",
+    "INDEX_DIR",
+]
