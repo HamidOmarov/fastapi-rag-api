@@ -1,2 +1,2 @@
-* text=auto
-*.md text
+* text=auto eol=lf
+README.md text eol=lf

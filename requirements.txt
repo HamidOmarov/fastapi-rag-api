@@ -8,3 +8,5 @@ sentencepiece
 sacremoses
 python-multipart
 pdfminer.six
+numpy
+requests
