@@ -1,12 +1,12 @@
 # app/api.py
 from __future__ import annotations
 
-from typing import List, Optional
-from collections import deque
-from datetime import datetime
-from time import perf_counter
-import re
 import os
+import re
+from collections import deque
+from datetime import datetime, timezone
+from time import perf_counter
+from typing import List, Optional, Dict, Any
 
 import faiss
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -16,11 +16,11 @@ from pydantic import BaseModel, Field
 
 from .rag_system import SimpleRAG, UPLOAD_DIR, INDEX_DIR
 
-# ------------------------------------------------------------------------------
-# App setup
-# ------------------------------------------------------------------------------
-app = FastAPI(title="RAG API", version="1.3.0")
+__version__ = "1.3.1"
 
+app = FastAPI(title="RAG API", version=__version__)
+
+# CORS (Streamlit UI üçün)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,9 +31,7 @@ app.add_middleware(
 
 rag = SimpleRAG()
 
-# ------------------------------------------------------------------------------
-# Models
-# ------------------------------------------------------------------------------
+# -------------------- Schemas --------------------
 class UploadResponse(BaseModel):
     filename: str
     chunks_added: int
@@ -54,34 +52,28 @@ class HistoryResponse(BaseModel):
     total_chunks: int
     history: List[HistoryItem] = []
 
-# ------------------------------------------------------------------------------
-# Lightweight stats store (in-memory)
-# ------------------------------------------------------------------------------
+# -------------------- Stats (in-memory) --------------------
 class StatsStore:
     def __init__(self):
         self.documents_indexed = 0
         self.questions_answered = 0
         self.latencies_ms = deque(maxlen=500)
-        # Mon..Sun simple counter (index 0 = today for simplicity)
-        self.last7_questions = deque([0] * 7, maxlen=7)
-        self.history = deque(maxlen=50)  # recent questions
+        self.last7_questions = deque([0] * 7, maxlen=7)  # sadə günlük sayğac
+        self.history = deque(maxlen=50)
 
     def add_docs(self, n: int):
         if n > 0:
-            self.documents_indexed += n
+            self.documents_indexed += int(n)
 
     def add_question(self, latency_ms: Optional[int] = None, q: Optional[str] = None):
         self.questions_answered += 1
         if latency_ms is not None:
             self.latencies_ms.append(int(latency_ms))
-        if len(self.last7_questions) < 7:
-            self.last7_questions.appendleft(1)
-        else:
-            # attribute to "today" bucket
+        if len(self.last7_questions) == 7:
             self.last7_questions[0] += 1
         if q:
             self.history.appendleft(
-                {"question": q, "timestamp": datetime.utcnow().isoformat()}
+                {"question": q, "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds")}
             )
 
     @property
@@ -90,96 +82,76 @@ class StatsStore:
 
 stats = StatsStore()
 
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-_GENERIC_PATTERNS = [
-    r"\bbased on document context\b",
-    r"\bappears to be\b",
-    r"\bgeneral (?:summary|overview)\b",
-]
-
+# -------------------- Helpers --------------------
 _STOPWORDS = {
     "the","a","an","of","for","and","or","in","on","to","from","with","by","is","are",
-    "was","were","be","been","being","at","as","that","this","these","those","it",
-    "its","into","than","then","so","such","about","over","per","via","vs","within"
+    "was","were","be","been","being","at","as","that","this","these","those","it","its",
+    "into","than","then","so","such","about","over","per","via","vs","within"
 }
 
-def is_generic_answer(text: str) -> bool:
+def _tokenize(s: str) -> List[str]:
+    return [w for w in re.findall(r"[a-zA-Z0-9]+", s.lower()) if w and w not in _STOPWORDS and len(w) > 2]
+
+def _is_generic_answer(text: str) -> bool:
     if not text:
         return True
     low = text.strip().lower()
     if len(low) < 15:
         return True
-    for pat in _GENERIC_PATTERNS:
-        if re.search(pat, low):
-            return True
+    # tipik generik pattern-lər
+    if "based on document context" in low or "appears to be" in low:
+        return True
     return False
 
-def tokenize(s: str) -> List[str]:
-    return [w for w in re.findall(r"[a-zA-Z0-9]+", s.lower()) if w and w not in _STOPWORDS and len(w) > 2]
-
-def extractive_answer(question: str, contexts: List[str], max_chars: int = 500) -> str:
-    """
-    Simple keyword-based extractive fallback:
-    pick sentences containing most question tokens.
-    """
+def _extractive_fallback(question: str, contexts: List[str], max_chars: int = 600) -> str:
+    """ Sualın açar sözlərinə əsasən kontekstdən cümlələr seç. """
     if not contexts:
         return "I couldn't find relevant information in the indexed documents for this question."
+    qtok = set(_tokenize(question))
+    if not qtok:
+        return (contexts[0] or "")[:max_chars]
 
-    q_tokens = set(tokenize(question))
-    if not q_tokens:
-        # if question is e.g. numbers only
-        q_tokens = set(tokenize(" ".join(contexts[:1])))
-
-    # split into sentences
+    # cümlələrə böl və skorla
     sentences: List[str] = []
     for c in contexts:
-        c = c or ""
-        # rough sentence split
-        for s in re.split(r"(?<=[\.!\?])\s+|\n+", c.strip()):
+        for s in re.split(r"(?<=[\.!\?])\s+|\n+", (c or "").strip()):
             s = s.strip()
             if s:
                 sentences.append(s)
 
-    if not sentences:
-        # fallback to first context chunk
-        return (contexts[0] or "")[:max_chars]
-
-    # score sentences
     scored: List[tuple[int, str]] = []
     for s in sentences:
-        toks = set(tokenize(s))
-        score = len(q_tokens & toks)
-        scored.append((score, s))
-
-    # pick top sentences with score > 0, otherwise first few sentences
+        st = set(_tokenize(s))
+        scored.append((len(qtok & st), s))
     scored.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
-    picked: List[str] = []
 
-    for score, sent in scored:
-        if score <= 0 and picked:
+    picked: List[str] = []
+    for sc, s in scored:
+        if sc <= 0 and picked:
             break
-        if len(" ".join(picked) + " " + sent) > max_chars:
+        if len((" ".join(picked) + " " + s).strip()) > max_chars:
             break
-        picked.append(sent)
+        picked.append(s)
 
     if not picked:
-        # no overlap, take first ~max_chars from contexts
         return (contexts[0] or "")[:max_chars]
+    bullets = "\n".join(f"- {p}" for p in picked)
+    return f"Answer (based on document context):\n{bullets}"
 
-    return " ".join(picked).strip()
-
-# ------------------------------------------------------------------------------
-# Routes
-# ------------------------------------------------------------------------------
+# -------------------- Routes --------------------
 @app.get("/")
 def root():
     return RedirectResponse(url="/docs")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": app.version, "summarizer": "extractive_en + translate + fallback"}
+    return {
+        "status": "ok",
+        "version": app.version,
+        "summarizer": "extractive_en + translate + keyword_fallback",
+        "faiss_ntotal": int(getattr(rag.index, "ntotal", 0)),
+        "model_dim": int(getattr(rag.index, "d", rag.embed_dim)),
+    }
 
 @app.get("/debug/translate")
 def debug_translate():
@@ -220,34 +192,35 @@ def ask_question(payload: AskRequest):
     k = max(1, int(payload.top_k))
     t0 = perf_counter()
 
-    # retrieval
+    # 1) Həmişə sual embedding-i ilə axtar
     try:
-        hits = rag.search(q, k=k)  # expected: List[Tuple[str, float]]
+        hits = rag.search(q, k=k)  # List[Tuple[text, score]]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {e}")
 
-    contexts = [c for c, _ in (hits or []) if c] or (rag.last_added[:k] if getattr(rag, "last_added", None) else [])
+    contexts = [c for c, _ in (hits or []) if c] or (getattr(rag, "last_added", [])[:k] if getattr(rag, "last_added", None) else [])
 
     if not contexts:
-        stats.add_question(int((perf_counter() - t0) * 1000), q=q)
+        latency_ms = int((perf_counter() - t0) * 1000)
+        stats.add_question(latency_ms, q=q)
         return AskResponse(
             answer="I couldn't find relevant information in the indexed documents for this question.",
             contexts=[]
         )
 
-    # synthesis (LLM or rule-based inside rag)
+    # 2) Cavabı sintez et (rag içində LLM/rule-based ola bilər)
     try:
-        synthesized = rag.synthesize_answer(q, contexts) or ""
+        synthesized = (rag.synthesize_answer(q, contexts) or "").strip()
     except Exception:
         synthesized = ""
 
-    # guard against generic/unchanging answers
-    if is_generic_answer(synthesized):
-        synthesized = extractive_answer(q, contexts, max_chars=600)
+    # 3) Generic görünürsə, extractive fallback
+    if _is_generic_answer(synthesized):
+        synthesized = _extractive_fallback(q, contexts, max_chars=600)
 
     latency_ms = int((perf_counter() - t0) * 1000)
     stats.add_question(latency_ms, q=q)
-    return AskResponse(answer=synthesized.strip(), contexts=contexts)
+    return AskResponse(answer=synthesized, contexts=contexts)
 
 @app.get("/get_history", response_model=HistoryResponse)
 def get_history():
@@ -258,7 +231,6 @@ def get_history():
 
 @app.get("/stats")
 def stats_endpoint():
-    # keep backward compat fields + add dashboard-friendly metrics
     return {
         "documents_indexed": stats.documents_indexed,
         "questions_answered": stats.questions_answered,
@@ -282,7 +254,6 @@ def reset_index():
                 os.remove(p)
             except FileNotFoundError:
                 pass
-        # also reset stats counters to avoid stale analytics
         stats.documents_indexed = 0
         stats.questions_answered = 0
         stats.latencies_ms.clear()
