@@ -11,3 +11,4 @@ __pycache__/
 *.faiss
 faiss.index
 *.pdf
+README.bak.md
