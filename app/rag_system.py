@@ -4,122 +4,118 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import faiss
 import numpy as np
+from ftfy import fix_text as _ftfy_fix
 
 # Prefer pypdf; fallback to PyPDF2 if needed
 try:
-    from pypdf import PdfReader
-except Exception:
-    from PyPDF2 import PdfReader  # type: ignore
+    from pypdf import PdfReader  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+    except Exception:  # pragma: no cover
+        PdfReader = None  # will try pdfminer if available
 
+# sentence-transformers encoder
 from sentence_transformers import SentenceTransformer
-from ftfy import fix_text
+
 
 # ---------------- Paths & Cache (HF-safe) ----------------
-ROOT_DIR = Path(os.getenv("APP_ROOT", "/app"))
+ROOT_DIR = Path(os.getenv("APP_ROOT", "/app"))  # HF Spaces writeable base
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT_DIR / "data")))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads")))
 INDEX_DIR = Path(os.getenv("INDEX_DIR", str(DATA_DIR / "index")))
-CACHE_DIR = Path(os.getenv("HF_HOME", str(ROOT_DIR / ".cache")))
+CACHE_DIR = Path(os.getenv("HF_HOME", str(ROOT_DIR / ".cache")))  # transformers uses HF_HOME
 
 for d in (DATA_DIR, UPLOAD_DIR, INDEX_DIR, CACHE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+
 # ---------------- Config ----------------
 MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").lower()
+OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").strip().lower()  # "en" → translate AZ→EN
 
-# ---------------- Helpers ----------------
-AZ_CHARS = set("əğıöşçüİıĞÖŞÇÜƏ")
-NUM_TOKEN_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|set|mt)\b", re.IGNORECASE)
 
-AZ_LATIN = "A-Za-zƏəĞğİıÖöŞşÇç"
+# ---------------- Text helpers ----------------
+# Join AZ letters split by spaces (e.g., "H Ə F T Ə" → "HƏFTƏ")
+AZ_LATIN = "A-Za-zƏəĞğİıÖöŞşÇçÜü"
 _SINGLE_LETTER_RUN = re.compile(rf"\b(?:[{AZ_LATIN}]\s+){{2,}}[{AZ_LATIN}]\b")
 
 def _fix_intra_word_spaces(s: str) -> str:
-    # "H Ə F T Ə" -> "HƏFTƏ"
     if not s:
         return s
     return _SINGLE_LETTER_RUN.sub(lambda m: re.sub(r"\s+", "", m.group(0)), s)
 
 def _fix_mojibake(s: str) -> str:
-    # Try to undo latin-1/utf-8 mess, then ftfy as final pass
+    """Fix common UTF-8-as-Latin-1 mojibake quickly; then ftfy."""
     if not s:
         return s
-    try:
-        if any(ch in s for ch in ("Ã", "Ä", "Å", "Ð", "Þ", "þ")):
+    if any(sym in s for sym in ("Ã", "Ä", "Å", "Ð", "Þ", "þ", "â")):
+        try:
             s = s.encode("latin-1", "ignore").decode("utf-8", "ignore")
-    except Exception:
-        pass
-    s = fix_text(s)
-    s = _fix_intra_word_spaces(s)
-    return s
-
-def _split_sentences(text: str) -> List[str]:
-    return [s.strip() for s in re.split(r"(?<=[\.!\?])\s+|[\r\n]+", text) if s.strip()]
-
-def _mostly_numeric(s: str) -> bool:
-    alnum = [c for c in s if c.isalnum()]
-    if not alnum:
-        return True
-    digits = sum(c.isdigit() for c in alnum)
-    return digits / max(1, len(alnum)) > 0.3
-
-def _tabular_like(s: str) -> bool:
-    hits = len(NUM_TOKEN_RE.findall(s))
-    return hits >= 2 or "Page" in s or len(s) < 20
+        except Exception:
+            pass
+    # ftfy final pass (safe on already-correct text)
+    return _ftfy_fix(s)
 
 def _clean_for_summary(text: str) -> str:
+    """Remove ultra-short / numeric / tabular-ish lines, collapse spaces."""
+    NUM_TOKEN_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|mt|m2)\b", re.IGNORECASE)
+
+    def _mostly_numeric(s: str) -> bool:
+        alnum = [c for c in s if c.isalnum()]
+        if not alnum:
+            return True
+        digits = sum(c.isdigit() for c in alnum)
+        return digits / max(1, len(alnum)) > 0.30
+
+    def _tabular_like(s: str) -> bool:
+        hits = len(NUM_TOKEN_RE.findall(s))
+        return hits >= 2 or "Page" in s or len(s) < 20
+
     out = []
     for ln in text.splitlines():
         t = " ".join(ln.split())
-        t = _fix_mojibake(t)
         if not t or _mostly_numeric(t) or _tabular_like(t):
             continue
         out.append(t)
     return " ".join(out)
 
-def _sim_jaccard(a: str, b: str) -> float:
-    aw = set(a.lower().split()); bw = set(b.lower().split())
-    if not aw or not bw:
-        return 0.0
-    return len(aw & bw) / len(aw | bw)
+def _split_sentences(text: str) -> List[str]:
+    # simple splitter ok for extractive snippets
+    return [s.strip() for s in re.split(r"(?<=[\.!\?])\s+|[\r\n]+", text) if s.strip()]
 
 STOPWORDS = {
     "the","a","an","and","or","of","to","in","on","for","with","by",
     "this","that","these","those","is","are","was","were","be","been","being",
     "at","as","it","its","from","into","about","over","after","before","than",
-    "such","can","could","should","would","may","might","will","shall"
+    "such","can","could","should","would","may","might","will","shall",
 }
+
 def _keywords(text: str) -> List[str]:
     toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", text.lower())
     return [t for t in toks if t not in STOPWORDS and len(t) > 2]
 
-def _looks_azerbaijani(s: str) -> bool:
-    has_az = any(ch in AZ_CHARS for ch in s)
-    non_ascii_ratio = sum(ord(c) > 127 for c in s) / max(1, len(s))
-    return has_az or non_ascii_ratio > 0.15
+def _sim_jaccard(a: str, b: str) -> float:
+    aw = set(a.lower().split())
+    bw = set(b.lower().split())
+    if not aw or not bw:
+        return 0.0
+    return len(aw & bw) / len(aw | bw)
 
-# ---- Descoped/out-of-scope heuristics ----
-DESCOPED_KWS = [
-    "descoped","out of scope","out-of-scope","exclude","excluded","exclusion",
-    "çıxarılan","çıxarıl","çıxarıldı","daxil deyil","sökül","demontaj","kəsilmə",
-]
-def _descoped_mode(question: str) -> bool:
-    ql = (question or "").lower()
-    return any(k in ql for k in DESCOPED_KWS) or "descop" in ql
-
-def _is_descoped_line(s: str) -> bool:
-    sl = s.lower()
-    if any(k in sl for k in DESCOPED_KWS):
-        return True
-    return bool(re.search(r"\b(out[-\s]?of[-\s]?scope|descop)", sl))
 
 # ---------------- RAG Core ----------------
 class SimpleRAG:
+    """
+    Minimal RAG core:
+    - FAISS (IP) over sentence-transformers embeddings
+    - PDF → texts with robust decoding (pypdf/PyPDF2 + ftfy; optional pdfminer fallback)
+    - Extractive answer synthesis with embedding ranking + keyword fallback
+    """
+
     def __init__(
         self,
         index_path: Path = INDEX_DIR / "faiss.index",
@@ -138,7 +134,7 @@ class SimpleRAG:
         self.index: faiss.Index = faiss.IndexFlatIP(self.embed_dim)
         self.chunks: List[str] = []
         self.last_added: List[str] = []
-        self._translator = None  # lazy
+        self._translator = None  # lazy init
 
         self._load()
 
@@ -161,22 +157,67 @@ class SimpleRAG:
         faiss.write_index(self.index, str(self.index_path))
         np.save(self.meta_path, np.array(self.chunks, dtype=object))
 
-    # ---------- Utilities ----------
+    # ---------- Public utils ----------
     @property
     def is_empty(self) -> bool:
         return getattr(self.index, "ntotal", 0) == 0 or not self.chunks
 
+    @property
+    def faiss_ntotal(self) -> int:
+        return int(getattr(self.index, "ntotal", 0))
+
+    @property
+    def model_dim(self) -> int:
+        return int(self.embed_dim)
+
+    def reset_index(self) -> None:
+        self.index = faiss.IndexFlatIP(self.embed_dim)
+        self.chunks = []
+        self.last_added = []
+        try:
+            if self.index_path.exists():
+                self.index_path.unlink()
+        except Exception:
+            pass
+        try:
+            if self.meta_path.exists():
+                self.meta_path.unlink()
+        except Exception:
+            pass
+
+    # ---------- PDF → texts ----------
     @staticmethod
     def _pdf_to_texts(pdf_path: Path, step: int = 800) -> List[str]:
-        reader = PdfReader(str(pdf_path))
-        pages: List[str] = []
-        for p in reader.pages:
-            t = p.extract_text() or ""
-            t = _fix_mojibake(t)
-            if t.strip():
-                pages.append(t)
+        texts: List[str] = []
+
+        # A) pypdf / PyPDF2
+        if PdfReader is not None:
+            try:
+                reader = PdfReader(str(pdf_path))
+                for p in getattr(reader, "pages", []):
+                    t = p.extract_text() or ""
+                    t = _fix_mojibake(t)
+                    t = _fix_intra_word_spaces(t)
+                    if t.strip():
+                        texts.append(t)
+            except Exception:
+                pass
+
+        # B) Optional pdfminer fallback if nothing extracted
+        if not texts:
+            try:
+                from pdfminer.high_level import extract_text  # type: ignore
+                raw = extract_text(str(pdf_path)) or ""
+                raw = _fix_mojibake(raw)
+                raw = _fix_intra_word_spaces(raw)
+                if raw.strip():
+                    texts = [raw]
+            except Exception:
+                pass
+
+        # Split to fixed-size chunks (simple & fast)
         chunks: List[str] = []
-        for txt in pages:
+        for txt in texts:
             for i in range(0, len(txt), step):
                 part = txt[i : i + step].strip()
                 if part:
@@ -188,6 +229,9 @@ class SimpleRAG:
         texts = self._pdf_to_texts(pdf_path)
         if not texts:
             return 0
+        # final cleaning for safety
+        texts = [_fix_mojibake(_fix_intra_word_spaces(t)) for t in texts]
+
         emb = self.model.encode(
             texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False
         )
@@ -202,7 +246,7 @@ class SimpleRAG:
         if self.is_empty:
             return []
         q = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-        k = max(1, min(int(k or 5), getattr(self.index, "ntotal", 1)))
+        k = max(1, min(int(k or 5), self.faiss_ntotal or 1))
         D, I = self.index.search(q, k)
         out: List[Tuple[str, float]] = []
         if I.size > 0 and self.chunks:
@@ -216,7 +260,7 @@ class SimpleRAG:
         if not texts:
             return texts
         try:
-            from transformers import pipeline
+            from transformers import pipeline  # lazy import
             if self._translator is None:
                 self._translator = pipeline(
                     "translation",
@@ -225,35 +269,35 @@ class SimpleRAG:
                     device=-1,
                 )
             outs = self._translator(texts, max_length=400)
-            return [fix_text(o["translation_text"].strip()) for o in outs]
+            return [o["translation_text"].strip() for o in outs]
         except Exception:
-            return texts
+            return texts  # graceful fallback
 
     # ---------- Fallbacks ----------
-    def _keyword_fallback(self, question: str, pool: List[str], limit_sentences: int = 4, allow_numeric: bool = False) -> List[str]:
+    def _keyword_fallback(self, question: str, pool: List[str], limit_sentences: int = 4) -> List[str]:
         qk = set(_keywords(question))
         if not qk:
             return []
         candidates: List[Tuple[float, str]] = []
-        for text in pool[:400]:
-            cleaned = _fix_mojibake(" ".join(text.split()))
+        for text in pool[:200]:
+            cleaned = _clean_for_summary(text)
             for s in _split_sentences(cleaned):
-                if not allow_numeric:
-                    if _tabular_like(s) or _mostly_numeric(s):
-                        continue
+                w = s.split()
+                if not (8 <= len(w) <= 40):
+                    continue
                 toks = set(_keywords(s))
                 if not toks:
                     continue
                 overlap = len(qk & toks)
-                if overlap == 0 and not _is_descoped_line(s):
+                if overlap == 0:
                     continue
-                length_penalty = max(6, min(60, len(s.split())))
-                score = overlap + (0.3 if _is_descoped_line(s) else 0.0) + min(0.5, overlap / length_penalty)
+                length_penalty = max(8, min(40, len(w)))
+                score = overlap + min(0.5, overlap / length_penalty)
                 candidates.append((score, s))
         candidates.sort(key=lambda x: x[0], reverse=True)
+
         out: List[str] = []
         for _, s in candidates:
-            s = fix_text(s).strip()
             if any(_sim_jaccard(s, t) >= 0.82 for t in out):
                 continue
             out.append(s)
@@ -266,24 +310,17 @@ class SimpleRAG:
         if not contexts and self.is_empty:
             return "No relevant context found. Index is empty — upload a PDF first."
 
-        desc_mode = _descoped_mode(question)
+        # Strong decoding & spacing fixes on contexts
+        contexts = [_fix_mojibake(_fix_intra_word_spaces(c)) for c in (contexts or [])]
 
-        # Build candidate sentences from nearby contexts
+        # Build candidate sentences from top contexts
         local_pool: List[str] = []
-        scan_n = 8 if desc_mode else 5
-        for c in (contexts or [])[:scan_n]:
-            cleaned = _fix_mojibake(" ".join(c.split()))
+        for c in (contexts or [])[:5]:
+            cleaned = _clean_for_summary(c)
             for s in _split_sentences(cleaned):
                 w = s.split()
-                if not ( (6 if desc_mode else 8) <= len(w) <= (60 if desc_mode else 35) ):
+                if not (8 <= len(w) <= 40):
                     continue
-                if not desc_mode:
-                    if _tabular_like(s) or _mostly_numeric(s):
-                        continue
-                else:
-                    # allow numeric/tabular if it looks like descoped line
-                    if not _is_descoped_line(s) and (_tabular_like(s) or _mostly_numeric(s)):
-                        continue
                 local_pool.append(" ".join(w))
 
         selected: List[str] = []
@@ -293,32 +330,34 @@ class SimpleRAG:
             scores = (cand_emb @ q_emb.T).ravel()
             order = np.argsort(-scores)
             for i in order:
-                s = fix_text(local_pool[i]).strip()
+                s = local_pool[i].strip()
                 if any(_sim_jaccard(s, t) >= 0.82 for t in selected):
                     continue
                 selected.append(s)
                 if len(selected) >= max_sentences:
                     break
 
+        # Fallback via keywords over entire corpus
         if not selected:
-            selected = self._keyword_fallback(
-                question,
-                self.chunks,
-                limit_sentences=max_sentences,
-                allow_numeric=desc_mode,  # relax numeric filter for descoped Qs
-            )
+            selected = self._keyword_fallback(question, self.chunks, limit_sentences=max_sentences)
 
         if not selected:
             return "No readable sentences matched the question. Try a more specific query."
 
-        # Translate to EN if needed (and requested)
-        if OUTPUT_LANG == "en":
-            needs_tr = any(_looks_azerbaijani(s) for s in selected) or any(ch in "".join(selected) for ch in ("Ã","Ä","Þ"))
-            if needs_tr:
+        # Optional AZ→EN translate if output language is English and text is non-ASCII
+        if OUTPUT_LANG == "en" and any(ord(ch) > 127 for ch in " ".join(selected)):
+            try:
                 selected = self._translate_to_en(selected)
+            except Exception:
+                pass
 
         bullets = "\n".join(f"- {s}" for s in selected)
         return f"Answer (based on document context):\n{bullets}"
 
 
-__all__ = ["SimpleRAG", "UPLOAD_DIR", "INDEX_DIR"]
+# Public API
+__all__ = [
+    "SimpleRAG",
+    "UPLOAD_DIR",
+    "INDEX_DIR",
+]
