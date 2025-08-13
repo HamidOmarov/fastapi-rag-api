@@ -12,3 +12,7 @@ __pycache__/
 faiss.index
 *.pdf
 README.bak.md
+answers_smoke.json
+triple_check_results.json
+r1.json
+r2.json
