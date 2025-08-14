@@ -1,2 +1,4 @@
-* text=auto eol=lf
-README.md text eol=lf
+﻿* text=auto
+*.md text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
