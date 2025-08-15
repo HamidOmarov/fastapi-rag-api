@@ -1,8 +1,8 @@
-# app/store.py
+﻿# app/store.py
 from collections import defaultdict
 from typing import List, Dict
 
-# in-memory chat tarixi (prod üçün Redis/Postgres məsləhətdir)
+# in-memory chat tarixi (prod ГјГ§Гјn Redis/Postgres mЙ™slЙ™hЙ™tdir)
 _history: Dict[str, List[dict]] = defaultdict(list)
 
 def add_history(session_id: str, role: str, content: str):

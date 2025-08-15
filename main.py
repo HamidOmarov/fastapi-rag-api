@@ -1,4 +1,4 @@
-# --- ADD: /generate alias for compatibility ---
+﻿# --- ADD: /generate alias for compatibility ---
 from fastapi import Form
 
 @app.post("/generate")

@@ -1,4 +1,4 @@
-# app/utils.py
+﻿# app/utils.py
 import uuid
 from fastapi import HTTPException
 

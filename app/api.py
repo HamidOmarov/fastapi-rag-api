@@ -1,4 +1,4 @@
-# app/api.py
+﻿# app/api.py
 from __future__ import annotations
 
 import time
@@ -18,7 +18,7 @@ __version__ = "1.3.2"
 
 app = FastAPI(title="RAG API", version=__version__)
 
-# ───────────────────────── CORS ─────────────────────────
+# в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ CORS в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],          # tighten if needed
@@ -27,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ──────────────────── Core singleton & metrics ────────────────────
+# в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ Core singleton & metrics в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 rag = SimpleRAG()
 
 METRICS: Dict[str, Any] = {
@@ -38,7 +38,7 @@ METRICS: Dict[str, Any] = {
 }
 HISTORY: List[Dict[str, Any]] = []  # [{"question":..., "timestamp":...}]
 
-# ───────────────────────── Models ─────────────────────────
+# в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ Models в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 class UploadResponse(BaseModel):
     message: str
     filename: str
@@ -60,7 +60,7 @@ class HistoryResponse(BaseModel):
     total_chunks: int
     history: List[Dict[str, Any]]
 
-# ───────────────────────── Routes ─────────────────────────
+# в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ Routes в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 @app.get("/")
 def root():
     return RedirectResponse(url="/docs")
@@ -78,7 +78,7 @@ def health():
 @app.get("/debug/translate")
 def debug_translate():
     """
-    Simple smoke test for the AZ→EN translator pipeline (if available).
+    Simple smoke test for the AZв†’EN translator pipeline (if available).
     """
     try:
         from transformers import pipeline  # type: ignore
@@ -88,7 +88,7 @@ def debug_translate():
             cache_dir=str(rag.cache_dir),
             device=-1,
         )
-        out = tr("Sənəd təmiri və quraşdırılması ilə bağlı işlər görülüb.", max_length=80)[0]["translation_text"]
+        out = tr("SЙ™nЙ™d tЙ™miri vЙ™ quraЕџdД±rД±lmasД± ilЙ™ baДџlД± iЕџlЙ™r gГ¶rГјlГјb.", max_length=80)[0]["translation_text"]
         return {"ok": True, "example_out": out}
     except Exception as e:
         return {"ok": False, "error": str(e)}

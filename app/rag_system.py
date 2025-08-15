@@ -1,4 +1,4 @@
-# app/rag_system.py
+﻿# app/rag_system.py
 from __future__ import annotations
 
 import os
@@ -36,12 +36,12 @@ for d in (DATA_DIR, UPLOAD_DIR, INDEX_DIR, CACHE_DIR):
 
 # ---------------- Config ----------------
 MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").strip().lower()  # "en" → translate AZ→EN
+OUTPUT_LANG = os.getenv("OUTPUT_LANG", "en").strip().lower()  # "en" в†’ translate AZв†’EN
 
 
 # ---------------- Text helpers ----------------
-# Join AZ letters split by spaces (e.g., "H Ə F T Ə" → "HƏFTƏ")
-AZ_LATIN = "A-Za-zƏəĞğİıÖöŞşÇçÜü"
+# Join AZ letters split by spaces (e.g., "H ЖЏ F T ЖЏ" в†’ "HЖЏFTЖЏ")
+AZ_LATIN = "A-Za-zЖЏЙ™ДћДџД°Д±Г–Г¶ЕћЕџГ‡Г§ГњГј"
 _SINGLE_LETTER_RUN = re.compile(rf"\b(?:[{AZ_LATIN}]\s+){{2,}}[{AZ_LATIN}]\b")
 
 def _fix_intra_word_spaces(s: str) -> str:
@@ -53,7 +53,7 @@ def _fix_mojibake(s: str) -> str:
     """Fix common UTF-8-as-Latin-1 mojibake quickly; then ftfy."""
     if not s:
         return s
-    if any(sym in s for sym in ("Ã", "Ä", "Å", "Ð", "Þ", "þ", "â")):
+    if any(sym in s for sym in ("Гѓ", "Г„", "Г…", "Гђ", "Гћ", "Гѕ", "Гў")):
         try:
             s = s.encode("latin-1", "ignore").decode("utf-8", "ignore")
         except Exception:
@@ -63,7 +63,7 @@ def _fix_mojibake(s: str) -> str:
 
 def _clean_for_summary(text: str) -> str:
     """Remove ultra-short / numeric / tabular-ish lines, collapse spaces."""
-    NUM_TOKEN_RE = re.compile(r"\b(\d+[.,]?\d*|%|m²|azn|usd|eur|mt|m2)\b", re.IGNORECASE)
+    NUM_TOKEN_RE = re.compile(r"\b(\d+[.,]?\d*|%|mВІ|azn|usd|eur|mt|m2)\b", re.IGNORECASE)
 
     def _mostly_numeric(s: str) -> bool:
         alnum = [c for c in s if c.isalnum()]
@@ -96,7 +96,7 @@ STOPWORDS = {
 }
 
 def _keywords(text: str) -> List[str]:
-    toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", text.lower())
+    toks = re.findall(r"[A-Za-zГЂ-Г–Г-Г¶Гё-Гї0-9]+", text.lower())
     return [t for t in toks if t not in STOPWORDS and len(t) > 2]
 
 def _sim_jaccard(a: str, b: str) -> float:
@@ -112,7 +112,7 @@ class SimpleRAG:
     """
     Minimal RAG core:
     - FAISS (IP) over sentence-transformers embeddings
-    - PDF → texts with robust decoding (pypdf/PyPDF2 + ftfy; optional pdfminer fallback)
+    - PDF в†’ texts with robust decoding (pypdf/PyPDF2 + ftfy; optional pdfminer fallback)
     - Extractive answer synthesis with embedding ranking + keyword fallback
     """
 
@@ -185,7 +185,7 @@ class SimpleRAG:
         except Exception:
             pass
 
-    # ---------- PDF → texts ----------
+    # ---------- PDF в†’ texts ----------
     @staticmethod
     def _pdf_to_texts(pdf_path: Path, step: int = 800) -> List[str]:
         texts: List[str] = []
@@ -308,7 +308,7 @@ class SimpleRAG:
     # ---------- Answer Synthesis ----------
     def synthesize_answer(self, question: str, contexts: List[str], max_sentences: int = 4) -> str:
         if not contexts and self.is_empty:
-            return "No relevant context found. Index is empty — upload a PDF first."
+            return "No relevant context found. Index is empty вЂ” upload a PDF first."
 
         # Strong decoding & spacing fixes on contexts
         contexts = [_fix_mojibake(_fix_intra_word_spaces(c)) for c in (contexts or [])]
@@ -344,7 +344,7 @@ class SimpleRAG:
         if not selected:
             return "No readable sentences matched the question. Try a more specific query."
 
-        # Optional AZ→EN translate if output language is English and text is non-ASCII
+        # Optional AZв†’EN translate if output language is English and text is non-ASCII
         if OUTPUT_LANG == "en" and any(ord(ch) > 127 for ch in " ".join(selected)):
             try:
                 selected = self._translate_to_en(selected)
