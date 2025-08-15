@@ -7,3 +7,4 @@ def ensure_session(session_id: str | None) -> str:
 
 def http400(msg: str):
     raise HTTPException(status_code=400, detail=msg)
+

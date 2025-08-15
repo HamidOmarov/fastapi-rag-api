@@ -11,3 +11,4 @@ def get_stats():
 def get_history():
     s = tracker.get_stats()
     return {"history": s["lastN_questions"], "total_chunks": s["total_chunks"]}
+

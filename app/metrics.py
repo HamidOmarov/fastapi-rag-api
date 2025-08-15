@@ -40,3 +40,4 @@ class StatsTracker:
         }
 
 tracker = StatsTracker()
+

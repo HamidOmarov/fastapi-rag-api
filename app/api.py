@@ -1,4 +1,5 @@
-﻿# app/api.py
+﻿from app.storage import DATA_DIR, INDEX_DIR, HISTORY_JSON
+# app/api.py
 from __future__ import annotations
 
 import time
@@ -200,3 +201,15 @@ def reset_index():
         return {"message": "index reset", "ntotal": getattr(rag.index, "ntotal", 0)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.on_event("startup")
+async def _ensure_dirs():
+    try:
+        INDEX_DIR.mkdir(parents=True, exist_ok=True)
+        # HISTORY_JSON parent is DATA_DIR
+        HISTORY_JSON.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # boot-un dayanmasının qarşısını alaq
+        pass
+
+

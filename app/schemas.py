@@ -23,3 +23,4 @@ class HistoryItem(BaseModel):
 class HistoryResponse(BaseModel):
     session_id: str
     history: List[HistoryItem]
+

@@ -10,3 +10,4 @@ def add_history(session_id: str, role: str, content: str):
 
 def get_history(session_id: str) -> List[dict]:
     return _history.get(session_id, [])
+

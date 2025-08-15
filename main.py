@@ -13,3 +13,4 @@ async def generate_alias(
 @app.get("/health")
 def health_alias():
     return {"status": "ok"}
+
