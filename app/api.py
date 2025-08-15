@@ -1,6 +1,11 @@
+from app.storage import DATA_DIR, INDEX_DIR, HISTORY_JSON
+
 ﻿from app.storage import DATA_DIR, INDEX_DIR, HISTORY_JSON
+
+
+
 # app/api.py
-from __future__ import annotations
+
 
 import time
 from datetime import datetime, timezone
@@ -211,5 +216,3 @@ async def _ensure_dirs():
     except Exception:
         # boot-un dayanmasının qarşısını alaq
         pass
-
-
