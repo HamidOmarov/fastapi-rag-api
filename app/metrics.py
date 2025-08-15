@@ -1,4 +1,4 @@
-﻿from collections import deque, defaultdict
+from collections import deque, defaultdict
 from datetime import datetime, timedelta, timezone
 
 class StatsTracker:

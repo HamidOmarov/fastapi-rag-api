@@ -1,4 +1,4 @@
-﻿# app/rag_system.py
+# app/rag_system.py
 from __future__ import annotations
 
 import os

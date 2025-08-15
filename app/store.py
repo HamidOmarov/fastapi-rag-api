@@ -1,4 +1,4 @@
-﻿# app/store.py
+# app/store.py
 from collections import defaultdict
 from typing import List, Dict
 

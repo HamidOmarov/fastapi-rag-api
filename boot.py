@@ -1,4 +1,4 @@
-﻿import os, sys, importlib
+import os, sys, importlib
 import uvicorn
 
 candidates = [

@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter
+from fastapi import APIRouter
 from .metrics import tracker
 
 router = APIRouter()

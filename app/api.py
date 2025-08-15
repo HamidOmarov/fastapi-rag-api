@@ -1,6 +1,6 @@
 from app.storage import DATA_DIR, INDEX_DIR, HISTORY_JSON
 
-﻿from app.storage import DATA_DIR, INDEX_DIR, HISTORY_JSON
+from app.storage import DATA_DIR, INDEX_DIR, HISTORY_JSON
 
 
 
