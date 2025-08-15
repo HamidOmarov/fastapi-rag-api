@@ -30,7 +30,7 @@ class StatsTracker:
         last7 = []
         for i in range(6, -1, -1):
             d = today - timedelta(days=i)
-            last7.append({ "date": d.isoformat(), "questions": int(self._by_day.get(d, 0)) })
+            last7.append({"date": d.isoformat(), "questions": int(self._by_day.get(d, 0))})
         return {
             "total_chunks": int(self.total_chunks),
             "questions_answered": int(self.questions_answered),
