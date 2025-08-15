@@ -1,9 +1,33 @@
-FROM python:3.11-slim
+﻿FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
-ENV HF_HOME=/app/.cache TRANSFORMERS_CACHE=/app/.cache HUGGINGFACE_HUB_CACHE=/app/.cache SENTENCE_TRANSFORMERS_HOME=/app/.cache PYTHONUNBUFFERED=1
-RUN mkdir -p /app/.cache /app/data/uploads /app/data/index && chmod -R 777 /app/.cache /app/data
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Sistəm asılılıqları (faiss, pypdf və s. üçün build-essential faydalıdır)
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python asılılıqları
+COPY requirements.txt .
+RUN python -m pip install --upgrade pip && \
+    (pip install --no-cache-dir -r requirements.txt || true) && \
+    pip install --no-cache-dir fastapi uvicorn[standard]
+
+# Mənbə
 COPY . .
+
+# Default ENV-lər (kodunda istifadə olunursa)
+ENV APP_ROOT=/app \
+    DATA_DIR=/app/data \
+    UPLOAD_DIR=/app/uploads \
+    INDEX_DIR=/app/index \
+    HF_HOME=/app/.cache \
+    EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2 \
+    OUTPUT_LANG=en
+
+# HF $PORT-u verir; fallback 7860
 EXPOSE 7860
-CMD ["uvicorn","app.api:app","--host","0.0.0.0","--port","7860"]
+CMD ["python","-u","boot.py"]
