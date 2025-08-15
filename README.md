@@ -1,6 +1,18 @@
 ﻿---
+title: FastAPI RAG API
+emoji: 🧩
+colorFrom: purple
+colorTo: indigo
+sdk: docker
+pinned: false
 ---
+## 🚀 Available for Hire
 
+**Specialties:** RAG Systems | PDF Processing | FastAPI | LangChain  
+**Rate:** $15–45/hour  
+**Contact:** [Upwork](https://www.upwork.com/) · [Email](mailto:you@example.com)
+
+<hr />
 ## 🚀 Available for Hire
 
 **Specialties:** RAG Systems | PDF Processing | FastAPI | LangChain
@@ -20,4 +32,5 @@ Open /docs for the interactive API.
 ## Quick test
 curl -F "file=@sample.pdf" https://<API>/upload_pdf
 curl -H "Content-Type: application/json" -d "{\"question\":\"What is the document about?\",\"top_k\":5}" https://<API>/ask_question
+
 
